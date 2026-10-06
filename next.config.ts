@@ -1,8 +1,12 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  images: {
-    domains: ['res.cloudinary.com'],
+  // Mongoose / the MongoDB driver must stay outside the bundler so the
+  // connection pool survives across route handler invocations.
+  serverExternalPackages: ["mongoose", "mongodb", "bcrypt"],
+  experimental: {
+    // CSV payloads for the requestor importer can get large.
+    serverActions: { bodySizeLimit: "8mb" },
   },
 };
 

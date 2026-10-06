@@ -20,6 +20,9 @@
 # production
 /build
 
+# local probe scripts (one-off diagnostics)
+/*.cjs
+
 # misc
 .DS_Store
 *.pem
