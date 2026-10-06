@@ -14,7 +14,7 @@ import {
   PrimaryButton,
   AlertBanner,
 } from "@/components/app-shell";
-import { Download, Plus, X, Trash2 } from "lucide-react";
+import { Download, Plus, X, Trash2, ChevronUp, ChevronDown } from "lucide-react";
 import { api, downloadCsv } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
 import type { DropdownOption, Ticket, TicketListResponse } from "@/lib/client/types";
@@ -85,6 +85,14 @@ function TicketsView() {
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const [options, setOptions] = React.useState<Record<string, DropdownOption[] | undefined>>({});
   const [technicians, setTechnicians] = React.useState<Array<{ id: string; name: string }>>([]);
+  const [refreshNonce, setRefreshNonce] = React.useState(0);
+  const [sort, setSort] = React.useState<"newest" | "sla" | "updated">("newest");
+  const [bulkTechnicianId, setBulkTechnicianId] = React.useState("");
+  const [bulkStatus, setBulkStatus] = React.useState("");
+
+  React.useEffect(() => {
+    document.title = "Tickets — Help Desk";
+  }, []);
 
   React.useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(search.trim()), 300);
@@ -150,6 +158,7 @@ function TicketsView() {
         if (sourceFilter.length) params.set("source", sourceFilter.join(","));
         if (openOnly) params.set("openOnly", "true");
         if (breachedOnly) params.set("breachedOnly", "true");
+        params.set("sort", sort);
         if (dateFrom) {
           const d = fromDateInputValue(dateFrom);
           if (d) params.set("from", d.toISOString());
@@ -193,6 +202,8 @@ function TicketsView() {
     openOnly,
     breachedOnly,
     page,
+    sort,
+    refreshNonce,
   ]);
 
   const tabs = React.useMemo<Tab[]>(() => {
@@ -268,9 +279,10 @@ function TicketsView() {
           : `Updated ${response.updated} ticket(s).`,
       );
       setSelected(new Set());
+      setBulkTechnicianId("");
+      setBulkStatus("");
       router.refresh();
-      // Re-fetch by bumping a nonce via the dependency list.
-      setPage((current) => current);
+      setRefreshNonce((n) => n + 1);
     } catch (caught) {
       setError(caught);
     }
@@ -286,6 +298,7 @@ function TicketsView() {
     setOpenOnly(false);
     setBreachedOnly(false);
     setSearch("");
+    setDebouncedSearch("");
   }
 
   const canCreate = user?.permissions.createTicket;
@@ -444,8 +457,9 @@ function TicketsView() {
                 </span>
                 <Select
                   className="h-8 w-44"
-                  defaultValue=""
+                  value={bulkTechnicianId}
                   onChange={(event) => {
+                    setBulkTechnicianId(event.target.value);
                     if (event.target.value) void runBulk("assign", { technicianId: event.target.value });
                   }}
                 >
@@ -466,8 +480,9 @@ function TicketsView() {
                 </span>
                 <Select
                   className="h-8 w-40"
-                  defaultValue=""
+                  value={bulkStatus}
                   onChange={(event) => {
+                    setBulkStatus(event.target.value);
                     if (event.target.value) void runBulk("status", { status: event.target.value });
                   }}
                 >
@@ -537,16 +552,28 @@ function TicketsView() {
                         />
                       </th>
                     ) : null}
-                    <Th>Ticket</Th>
+                    <Th>Ticket #</Th>
                     <Th>Subject</Th>
                     <Th>Priority</Th>
                     <Th>Status</Th>
                     <Th>Requestor</Th>
                     <Th>Dept</Th>
                     <Th>Technician</Th>
-                    <Th>SLA</Th>
+                    <Th
+                      sortKey="sla"
+                      currentSort={sort}
+                      onSort={(key) => setSort(key as "newest" | "sla" | "updated")}
+                    >
+                      SLA
+                    </Th>
                     <Th>Source</Th>
-                    <Th>Created</Th>
+                    <Th
+                      sortKey="newest"
+                      currentSort={sort}
+                      onSort={(key) => setSort(key as "newest" | "sla" | "updated")}
+                    >
+                      Created
+                    </Th>
                   </tr>
                 </thead>
                 <tbody>
@@ -647,9 +674,21 @@ function TicketsView() {
             >
               Previous
             </button>
-            <span className="text-[10px] text-muted-foreground">
-              Page {page} of {totalPages}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-muted-foreground">Page</span>
+              <TextInput
+                type="number"
+                min={1}
+                max={totalPages}
+                value={page}
+                onChange={(event) => {
+                  const n = Number(event.target.value);
+                  if (n >= 1 && n <= totalPages) setPage(n);
+                }}
+                className="h-8 w-14 text-center"
+              />
+              <span className="text-[10px] text-muted-foreground">of {totalPages}</span>
+            </div>
             <button
               type="button"
               disabled={page >= totalPages}
@@ -699,7 +738,35 @@ function SlaCell({ ticket }: { ticket: Ticket }) {
   );
 }
 
-function Th({ children }: { children: React.ReactNode }) {
+function Th({
+  children,
+  sortKey,
+  currentSort,
+  onSort,
+}: {
+  children: React.ReactNode;
+  sortKey?: string;
+  currentSort?: string;
+  onSort?: (key: string) => void;
+}) {
+  const isActive = sortKey !== undefined && currentSort === sortKey;
+  if (sortKey && onSort) {
+    return (
+      <th
+        className="cursor-pointer select-none px-3 py-2 text-[9px] font-bold uppercase tracking-[0.15em] text-muted-foreground hover:text-foreground"
+        onClick={() => onSort(sortKey)}
+      >
+        <span className="inline-flex items-center gap-1">
+          {children}
+          {isActive ? (
+            <ChevronDown className="h-3 w-3" />
+          ) : (
+            <ChevronUp className="h-3 w-3 opacity-30" />
+          )}
+        </span>
+      </th>
+    );
+  }
   return (
     <th className="px-3 py-2 text-[9px] font-bold uppercase tracking-[0.15em] text-muted-foreground">
       {children}

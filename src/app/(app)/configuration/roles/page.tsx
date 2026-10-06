@@ -67,6 +67,10 @@ export default function RolesConfigPage() {
     void load();
   }, [load]);
 
+  React.useEffect(() => {
+    document.title = "Roles & Access — Help Desk";
+  }, []);
+
   async function savePermissions(role: Role, permissions: PermissionMap) {
     setSavingRoleId(role.id);
     setError(null);

@@ -10,7 +10,6 @@ import {
   ErrorNote,
   EmptyState,
   GhostButton,
-  TerminalBadge as Badge,
 } from "@/components/app-shell";
 import { RefreshCw, ExternalLink } from "lucide-react";
 import { api } from "@/lib/client/api";
@@ -55,6 +54,10 @@ export default function RecentTicketsPage() {
     void load();
   }, [load]);
 
+  React.useEffect(() => {
+    document.title = "Ticket Detail — Help Desk";
+  }, []);
+
   const newest = data?.tickets[0];
 
   return (
@@ -67,14 +70,16 @@ export default function RecentTicketsPage() {
     >
       <PageHeading
         title="Ticket Detail"
-        description="Most recently updated tickets. Open one to edit its fields and add remarks."
+        description="Most recently created tickets. Open one to edit its fields and add remarks."
       />
 
       <div className="space-y-4">
         <ErrorNote error={error} />
 
-        {newest ? (
-          <Panel title="Last Touched" hint="jump straight in">
+        <Panel title="Last Touched" hint="jump straight in">
+          {!loading && !newest ? (
+            <EmptyState title="No tickets yet" description="Create your first ticket to see it here." />
+          ) : newest ? (
             <div className="flex flex-wrap items-center justify-between gap-3 p-4">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
@@ -85,12 +90,12 @@ export default function RecentTicketsPage() {
                   >
                     {newest.ticketNumber}
                   </Link>
-                  <Badge
+                  <TerminalBadge
                     label={newest.priority.label || "—"}
                     color={newest.priority.color}
                     inactive={newest.priority.inactive}
                   />
-                  <Badge
+                  <TerminalBadge
                     label={newest.statusLabel || newest.status}
                     color={STATUS_COLORS[newest.status] ?? "#94a3b8"}
                   />
@@ -109,8 +114,8 @@ export default function RecentTicketsPage() {
                 Open <ExternalLink className="h-3.5 w-3.5" />
               </Link>
             </div>
-          </Panel>
-        ) : null}
+          ) : null}
+        </Panel>
 
         <Panel title="Recent Tickets" hint={`${data?.total ?? 0} total`}>
           {loading ? (

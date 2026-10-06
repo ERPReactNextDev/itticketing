@@ -30,7 +30,7 @@ export function formatDateTime(value: string | Date | null | undefined): string 
   const p = parts(date);
   const h12 = p.hour % 12 || 12;
   const ampm = p.hour < 12 ? "AM" : "PM";
-  return `${p.day} ${MONTHS[Number(p.month) - 1]} ${p.year}, ${h12}:${p.minute} ${ampm}`;
+  return `${p.day} ${MONTHS[Number(p.month) - 1]} ${p.year}, ${h12}:${String(p.minute).padStart(2, "0")} ${ampm}`;
 }
 
 export function formatTime(value: string | Date | null | undefined): string {

@@ -58,6 +58,10 @@ export default function DashboardPage() {
     };
   }, []);
 
+  React.useEffect(() => {
+    document.title = "Dashboard — Help Desk";
+  }, []);
+
   const totals = data?.totals;
   const statusCounts = React.useMemo(() => {
     const map = new Map((data?.byStatus ?? []).map((row) => [row.key, row.count]));
@@ -137,6 +141,7 @@ export default function DashboardPage() {
           <StatCard
             label="Total Tickets"
             value={loading ? "—" : (totals?.all ?? 0)}
+            loading={loading}
             hint={
               totals && totals.all > 0
                 ? `${statusCounts.pending + statusCounts.ongoing + statusCounts.scheduled} still open`
@@ -148,6 +153,7 @@ export default function DashboardPage() {
           <StatCard
             label="Resolved"
             value={loading ? "—" : statusCounts.resolved}
+            loading={loading}
             hint={
               totals && totals.all > 0
                 ? `${((statusCounts.resolved / totals.all) * 100).toFixed(1)}% resolve rate`
@@ -159,6 +165,7 @@ export default function DashboardPage() {
           <StatCard
             label="Ongoing"
             value={loading ? "—" : statusCounts.ongoing}
+            loading={loading}
             hint="Being worked on"
             accent="#f97316"
             icon={Loader2}
@@ -166,6 +173,7 @@ export default function DashboardPage() {
           <StatCard
             label="Pending"
             value={loading ? "—" : statusCounts.pending}
+            loading={loading}
             hint="Awaiting action"
             accent="#eab308"
             icon={Clock3}
@@ -173,6 +181,7 @@ export default function DashboardPage() {
           <StatCard
             label="From Gmail"
             value={loading ? "—" : (totals?.fromGmail ?? 0)}
+            loading={loading}
             hint="Auto-created via Resend"
             accent="#06b6d4"
             icon={Mail}
@@ -180,6 +189,7 @@ export default function DashboardPage() {
           <StatCard
             label="SLA Breached"
             value={loading ? "—" : (totals?.breached ?? 0)}
+            loading={loading}
             hint={
               totals?.avgResolutionSeconds
                 ? `Avg resolution ${formatDuration(totals.avgResolutionSeconds)}`
@@ -191,6 +201,7 @@ export default function DashboardPage() {
           <StatCard
             label="Scheduled"
             value={loading ? "—" : statusCounts.scheduled}
+            loading={loading}
             hint={totals?.inboundLast24h ? `${totals.inboundLast24h} new email(s) today` : "Planned work"}
             accent="#06b6d4"
             icon={Clock3}
@@ -198,6 +209,7 @@ export default function DashboardPage() {
           <StatCard
             label="Assigned Agents"
             value={loading ? "—" : assignedAgents}
+            loading={loading}
             hint="Agents with at least one ticket"
             accent="#8b5cf6"
             icon={Users}

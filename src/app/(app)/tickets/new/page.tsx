@@ -52,6 +52,10 @@ export default function NewTicketPage() {
   const [preview, setPreview] = React.useState<{ next: string; current: string } | null>(null);
 
   React.useEffect(() => {
+    document.title = "New Ticket — Help Desk";
+  }, []);
+
+  React.useEffect(() => {
     async function load() {
       try {
         const [dropdowns, settings] = await Promise.all([
@@ -571,6 +575,7 @@ function RequestorPicker({
                 onChange={(event) =>
                   setQuickAdd((current) => ({ ...current, firstName: event.target.value }))
                 }
+                autoFocus
               />
               <TextInput
                 placeholder="Last name"

@@ -46,6 +46,17 @@ function ProfileView() {
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<unknown>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
+  const [sessionTimeout, setSessionTimeout] = React.useState<number | null>(null);
+
+  React.useEffect(() => {
+    document.title = "My Profile — Help Desk";
+  }, []);
+
+  React.useEffect(() => {
+    api.get<{ settings: { sessionTimeoutMin: number } }>("/api/settings")
+      .then((r) => setSessionTimeout(r.settings.sessionTimeoutMin))
+      .catch(() => {});
+  }, []);
 
   async function changePassword(event: React.FormEvent) {
     event.preventDefault();
@@ -119,7 +130,7 @@ function ProfileView() {
             />
             <KeyValueRow
               label="Session Expires"
-              value={`${user ? "Activity" : "—"} after ${user ? "the configured timeout" : ""}`}
+              value={sessionTimeout ? `After ${sessionTimeout} minutes of inactivity` : "—"}
             />
             <div className="mt-3 flex items-center gap-2">
               <TerminalBadge label="Active" color="#22c55e" />

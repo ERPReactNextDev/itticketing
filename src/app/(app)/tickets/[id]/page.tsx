@@ -20,6 +20,7 @@ import {
   TextArea,
   AutoField,
   KeyValueRow,
+  TextInput,
   ACCENT,
 } from "@/components/ui/primitives";
 import {
@@ -82,6 +83,7 @@ export default function TicketDetailPage() {
 
   const [ticket, setTicket] = React.useState<Ticket | null>(null);
   const [options, setOptions] = React.useState<Record<string, DropdownOption[] | undefined>>({});
+  const [optionsLoaded, setOptionsLoaded] = React.useState(false);
   const [technicians, setTechnicians] = React.useState<Array<{ id: string; name: string }>>([]);
   const [error, setError] = React.useState<unknown>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
@@ -99,6 +101,7 @@ export default function TicketDetailPage() {
       const response = await api.get<{ ticket: Ticket }>(`/api/tickets/${id}`);
       setTicket(response.ticket);
       setReplyTo(response.ticket.requestorEmail ?? "");
+      document.title = `${response.ticket.ticketNumber} — Help Desk`;
       setError(null);
     } catch (caught) {
       setError(caught);
@@ -120,6 +123,8 @@ export default function TicketDetailPage() {
         setOptions(response.grouped ?? {});
       } catch {
         // Read-only views still work without options.
+      } finally {
+        setOptionsLoaded(true);
       }
     }
     void loadOptions();
@@ -270,7 +275,8 @@ export default function TicketDetailPage() {
               onClick={() =>
                 patch({ status: options.status?.find((o) => !["resolved", "closed", "cancelled"].includes(o.value))?.value ?? "pending" })
               }
-              disabled={saving}
+              disabled={saving || !optionsLoaded}
+              title={!optionsLoaded ? "Loading…" : undefined}
             >
               Reopen Ticket
             </PrimaryButton>
@@ -415,7 +421,7 @@ export default function TicketDetailPage() {
                 />
 
                 <LabeledField label="Scheduled Date">
-                  <input
+                  <TextInput
                     type="date"
                     defaultValue={ticket.scheduledDate ? ticket.scheduledDate.slice(0, 10) : ""}
                     disabled={!canEditAny}
@@ -430,7 +436,6 @@ export default function TicketDetailPage() {
                         void patch({ scheduledDate: next }, "Scheduled date changed");
                       }
                     }}
-                    className="h-9 w-full rounded-md border border-border bg-background px-2.5 text-[12px] outline-none focus:border-accent disabled:opacity-60"
                   />
                 </LabeledField>
               </div>
@@ -471,6 +476,11 @@ export default function TicketDetailPage() {
             </Panel>
 
             {/* Email composer */}
+            {showReply && !replyTo ? (
+              <p className="text-[10px] text-amber-600">
+                No email on file for this requestor. Enter a recipient address.
+              </p>
+            ) : null}
             {showReply && canReply ? (
               <Panel title="Reply via Email" hint={`via Resend from ${ticket.requestorEmail || "the requestor"}`}>
                 <form onSubmit={sendReply} className="space-y-3 p-4">
@@ -518,7 +528,11 @@ export default function TicketDetailPage() {
                   value={note}
                   onChange={(event) => setNote(event.target.value)}
                   placeholder="Add a note to the timeline. Notes cannot be deleted by other agents."
+                  maxLength={2000}
                 />
+                <p className="mt-1 text-right text-[9px] text-muted-foreground">
+                  {note.length}/2000
+                </p>
                 <div className="flex justify-end">
                   <PrimaryButton type="submit" icon={Save} disabled={saving || !note.trim()}>
                     {saving ? "Saving…" : "Add Remark"}
@@ -547,16 +561,17 @@ export default function TicketDetailPage() {
             {ticket.attachments.length > 0 ? (
               <Panel title="Attachments" hint={`${ticket.attachments.length} file(s)`}>
                 <ul className="divide-y divide-border">
-                  {ticket.attachments.map((fileId) => (
+                  {ticket.attachments.map((fileId, index) => (
                     <li key={fileId}>
                       <a
                         href={`/api/files/${fileId}`}
                         target="_blank"
                         rel="noreferrer"
                         className="flex items-center gap-2 px-4 py-2.5 text-[11px] hover:bg-muted"
+                        aria-label={`Download Attachment ${index + 1}`}
                       >
                         <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                        <span className="truncate">{fileId}</span>
+                        <span className="truncate">{`Attachment ${index + 1}`}</span>
                       </a>
                     </li>
                   ))}

@@ -47,8 +47,7 @@ export default function EmailConfigPage() {
   const [saving, setSaving] = React.useState(false);
   const [sending, setSending] = React.useState(false);
 
-  const load = React.useCallback(async () => {
-    setLoading(true);
+  const load = React.useCallback(async () => {    setLoading(true);
     try {
       const [statusResponse, settingsResponse] = await Promise.all([
         api.get<EmailStatus>("/api/email/status"),
@@ -74,6 +73,10 @@ export default function EmailConfigPage() {
   React.useEffect(() => {
     void load();
   }, [load]);
+
+  React.useEffect(() => {
+    document.title = "Email Settings — Help Desk";
+  }, []);
 
   async function save() {
     setSaving(true);

@@ -19,7 +19,7 @@ import {
   TextArea,
   ACCENT,
 } from "@/components/ui/primitives";
-import { Download, Upload, UserPlus, Pencil, X, Check } from "lucide-react";
+import { Download, Upload, UserPlus, Pencil, X, Check, Users as UsersIcon } from "lucide-react";
 import { api, downloadCsv } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
 import type { DropdownOption, Requestor } from "@/lib/client/types";
@@ -43,6 +43,7 @@ export default function RequestorsDirectoryPage() {
   const [notice, setNotice] = React.useState<React.ReactNode>(null);
 
   const [search, setSearch] = React.useState("");
+  const [debouncedSearch, setDebouncedSearch] = React.useState("");
   const [statusFilter, setStatusFilter] = React.useState("");
   const [options, setOptions] = React.useState<Record<string, DropdownOption[]>>({});
 
@@ -58,7 +59,7 @@ export default function RequestorsDirectoryPage() {
     setLoading(true);
     try {
       const params = new URLSearchParams();
-      if (search.trim()) params.set("search", search.trim());
+      if (debouncedSearch.trim()) params.set("search", debouncedSearch.trim());
       if (statusFilter) params.set("status", statusFilter);
       params.set("page", String(page));
       params.set("pageSize", "25");
@@ -77,12 +78,22 @@ export default function RequestorsDirectoryPage() {
     } finally {
       setLoading(false);
     }
-  }, [search, statusFilter, page]);
+  }, [debouncedSearch, statusFilter, page]);
+
+  // Debounce search input changes only.
+  React.useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search.trim()), 250);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  // Immediate fetch when page, debounced search, or status filter changes.
+  React.useEffect(() => {
+    void load();
+  }, [load]);
 
   React.useEffect(() => {
-    const timer = setTimeout(() => void load(), 250);
-    return () => clearTimeout(timer);
-  }, [load]);
+    document.title = "Requestors — Help Desk";
+  }, []);
 
   React.useEffect(() => {
     void (async () => {
@@ -259,6 +270,7 @@ export default function RequestorsDirectoryPage() {
           ) : requestors.length === 0 ? (
             <EmptyState
               title="No requestors found"
+              icon={UsersIcon}
               description={
                 search
                   ? "Try a different search."
@@ -368,9 +380,21 @@ export default function RequestorsDirectoryPage() {
             <GhostButton disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
               Previous
             </GhostButton>
-            <span className="text-[10px] text-muted-foreground">
-              Page {page} of {totalPages}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-muted-foreground">Page</span>
+              <TextInput
+                type="number"
+                min={1}
+                max={totalPages}
+                value={page}
+                onChange={(event) => {
+                  const n = Number(event.target.value);
+                  if (n >= 1 && n <= totalPages) setPage(n);
+                }}
+                className="h-8 w-14 text-center"
+              />
+              <span className="text-[10px] text-muted-foreground">of {totalPages}</span>
+            </div>
             <GhostButton disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
               Next
             </GhostButton>
@@ -445,6 +469,7 @@ function RequestorForm({
               required
               value={form.employeeId}
               onChange={(event) => setForm((c) => ({ ...c, employeeId: event.target.value }))}
+              autoFocus={!requestor}
             />
           </LabeledField>
           <LabeledField label="First Name" required>

@@ -45,6 +45,10 @@ export default function DropdownsConfigPage() {
   const [creating, setCreating] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
 
+  React.useEffect(() => {
+    document.title = "Configuration — Help Desk";
+  }, []);
+
   const load = React.useCallback(async () => {
     setLoading(true);
     try {
@@ -191,17 +195,20 @@ export default function DropdownsConfigPage() {
           title={`${TABS.find((tab) => tab.type === activeTab)?.label} Options`}
           hint={`${visible.length} option${visible.length === 1 ? "" : "s"}`}
           actions={
-            canManage ? (
-              <PrimaryButton
-                icon={Plus}
-                onClick={() => {
-                  setCreating(true);
-                  setDraft({ type: activeTab, label: "", value: "", order: visible.length });
-                }}
-              >
-                Add Option
-              </PrimaryButton>
-            ) : null
+            <div className="flex items-center gap-2">
+              <GhostButton icon={RotateCcw} onClick={() => void load()}>Reload</GhostButton>
+              {canManage ? (
+                <PrimaryButton
+                  icon={Plus}
+                  onClick={() => {
+                    setCreating(true);
+                    setDraft({ type: activeTab, label: "", value: "", order: visible.length });
+                  }}
+                >
+                  Add Option
+                </PrimaryButton>
+              ) : null}
+            </div>
           }
         >
           {loading ? (
@@ -299,6 +306,7 @@ export default function DropdownsConfigPage() {
                             disabled={index === 0 || !canManage}
                             className="text-[8px] leading-none text-muted-foreground hover:text-foreground disabled:opacity-30"
                             title="Move up"
+                            aria-label={`Move ${option.label} up`}
                           >
                             ▲
                           </button>
@@ -308,6 +316,7 @@ export default function DropdownsConfigPage() {
                             disabled={index === visible.length - 1 || !canManage}
                             className="text-[8px] leading-none text-muted-foreground hover:text-foreground disabled:opacity-30"
                             title="Move down"
+                            aria-label={`Move ${option.label} down`}
                           >
                             ▼
                           </button>
@@ -411,14 +420,23 @@ export default function DropdownsConfigPage() {
                     ) : null}
                     {hasColour ? (
                       <LabeledField label="Colour">
-                        <input
-                          type="color"
-                          value={draft?.color ?? "#f97316"}
-                          onChange={(event) =>
-                            setDraft((current) => ({ ...current, color: event.target.value }))
-                          }
-                          className="h-9 w-12 rounded border border-border"
-                        />
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="color"
+                            value={draft?.color ?? "#f97316"}
+                            onChange={(event) =>
+                              setDraft((current) => ({ ...current, color: event.target.value }))
+                            }
+                            className="h-9 w-12 rounded border border-border"
+                          />
+                          <TextInput
+                            value={draft?.color ?? "#f97316"}
+                            onChange={(event) =>
+                              setDraft((current) => ({ ...current, color: event.target.value }))
+                            }
+                            className="flex-1"
+                          />
+                        </div>
                       </LabeledField>
                     ) : null}
                     <div className="flex items-end gap-2 sm:col-span-2 lg:col-span-4">
@@ -445,13 +463,6 @@ export default function DropdownsConfigPage() {
           and display it as <strong>(inactive)</strong>, so historical records never go blank. Hard
           delete is only possible while no ticket references the option.
         </AlertBanner>
-
-        <GhostButton
-          icon={RotateCcw}
-          onClick={() => void load()}
-        >
-          Reload options
-        </GhostButton>
       </div>
     </AppPage>
   );

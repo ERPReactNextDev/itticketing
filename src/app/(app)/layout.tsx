@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { api } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
 import type { TicketListResponse } from "@/lib/client/types";
@@ -16,6 +16,7 @@ import type { TicketListResponse } from "@/lib/client/types";
 function AuthenticatedShell({ children }: { children: React.ReactNode }) {
   const { user, loading } = useSession();
   const router = useRouter();
+  const pathname = usePathname();
   const [openCount, setOpenCount] = React.useState<number | undefined>(undefined);
   const [gmailCard, setGmailCard] = React.useState<{ count: number; window: string }>();
 
@@ -23,8 +24,12 @@ function AuthenticatedShell({ children }: { children: React.ReactNode }) {
     if (loading) return;
     if (!user) {
       router.replace("/login");
+      return;
     }
-  }, [loading, user, router]);
+    if (user.mustChangePassword && !pathname?.startsWith("/profile")) {
+      router.replace("/profile?force=1");
+    }
+  }, [loading, user, router, pathname]);
 
   React.useEffect(() => {
     if (!user) return;

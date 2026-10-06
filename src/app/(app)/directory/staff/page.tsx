@@ -13,7 +13,7 @@ import {
   AlertBanner,
 } from "@/components/app-shell";
 import { LabeledField, TextInput, Select, ACCENT } from "@/components/ui/primitives";
-import { UserPlus, Pencil, X, KeyRound, Check } from "lucide-react";
+import { UserPlus, Pencil, X, KeyRound, Check, UserCog as UserCogIcon } from "lucide-react";
 import { api } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
 import type { Role, StaffUser } from "@/lib/client/types";
@@ -32,6 +32,7 @@ export default function StaffDirectoryPage() {
   const [notice, setNotice] = React.useState<string | null>(null);
 
   const [search, setSearch] = React.useState("");
+  const [debouncedSearch, setDebouncedSearch] = React.useState("");
   const [statusFilter, setStatusFilter] = React.useState("");
   const [editing, setEditing] = React.useState<StaffUser | null>(null);
   const [creating, setCreating] = React.useState(false);
@@ -43,7 +44,7 @@ export default function StaffDirectoryPage() {
     setLoading(true);
     try {
       const params = new URLSearchParams();
-      if (search.trim()) params.set("search", search.trim());
+      if (debouncedSearch.trim()) params.set("search", debouncedSearch.trim());
       if (statusFilter) params.set("status", statusFilter);
       params.set("page", String(page));
       params.set("pageSize", "25");
@@ -61,12 +62,22 @@ export default function StaffDirectoryPage() {
     } finally {
       setLoading(false);
     }
-  }, [search, statusFilter, page]);
+  }, [debouncedSearch, statusFilter, page]);
+
+  // Debounce search input only.
+  React.useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search.trim()), 250);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  // Immediate fetch on page/filter/debounced-search change.
+  React.useEffect(() => {
+    void load();
+  }, [load]);
 
   React.useEffect(() => {
-    const timer = setTimeout(() => void load(), 250);
-    return () => clearTimeout(timer);
-  }, [load]);
+    document.title = "Staff & Agents — Help Desk";
+  }, []);
 
   React.useEffect(() => {
     void (async () => {
@@ -181,7 +192,7 @@ export default function StaffDirectoryPage() {
               Loading…
             </p>
           ) : staff.length === 0 ? (
-            <EmptyState title="No accounts found" />
+            <EmptyState title="No accounts found" icon={UserCogIcon} />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[880px] text-left">
@@ -276,9 +287,21 @@ export default function StaffDirectoryPage() {
             <GhostButton disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
               Previous
             </GhostButton>
-            <span className="text-[10px] text-muted-foreground">
-              Page {page} of {totalPages}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-muted-foreground">Page</span>
+              <TextInput
+                type="number"
+                min={1}
+                max={totalPages}
+                value={page}
+                onChange={(event) => {
+                  const n = Number(event.target.value);
+                  if (n >= 1 && n <= totalPages) setPage(n);
+                }}
+                className="h-8 w-14 text-center"
+              />
+              <span className="text-[10px] text-muted-foreground">of {totalPages}</span>
+            </div>
             <GhostButton disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
               Next
             </GhostButton>
@@ -371,7 +394,7 @@ function StaffForm({
         <ErrorNote error={error ? new Error(error) : null} />
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <LabeledField label="Name" required>
-            <TextInput required value={form.name} onChange={(e) => setForm((c) => ({ ...c, name: e.target.value }))} />
+            <TextInput required value={form.name} onChange={(e) => setForm((c) => ({ ...c, name: e.target.value }))} autoFocus={!account} />
           </LabeledField>
           <LabeledField label="Email" required>
             <TextInput

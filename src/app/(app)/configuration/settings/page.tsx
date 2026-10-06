@@ -60,6 +60,19 @@ const TOKENS = [
   { token: "{SEQ:4}", label: "Sequence (4)", example: "0001" },
 ];
 
+/** Builds the date/seq parts used by the live preview. */
+function buildPreviewParts(preview: { current: string; next: string; dateKey: string } | null) {
+  const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
+  const nextSeq = preview ? Number(preview.current.split(/[-/]/).pop() ?? "0") + 1 : 1;
+  return {
+    year: String(now.getUTCFullYear()),
+    year2: String(now.getUTCFullYear()).slice(-2),
+    month: String(now.getUTCMonth() + 1).padStart(2, "0"),
+    day: String(now.getUTCDate()).padStart(2, "0"),
+    nextSeq: Number.isFinite(nextSeq) ? nextSeq : 1,
+  };
+}
+
 export default function SettingsConfigPage() {
   const [settings, setSettings] = React.useState<Settings | null>(null);
   const [options, setOptions] = React.useState<Record<string, DropdownOption[]>>({});
@@ -74,6 +87,10 @@ export default function SettingsConfigPage() {
   // Local editable copy so typing never fights the server state.
   const [form, setForm] = React.useState<Settings | null>(null);
   const [livePreview, setLivePreview] = React.useState("");
+
+  React.useEffect(() => {
+    document.title = "Settings — Help Desk";
+  }, []);
 
   React.useEffect(() => {
     async function load() {
@@ -105,7 +122,7 @@ export default function SettingsConfigPage() {
    */
   React.useEffect(() => {
     if (!form) return;
-    const parts = buildParts();
+    const parts = buildPreviewParts(preview);
     const seqPad = form.seqPadLength;
     setLivePreview(
       form.ticketNumberPattern.replace(
@@ -132,7 +149,6 @@ export default function SettingsConfigPage() {
         },
       ),
     );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [form?.ticketNumberPattern, form?.ticketPrefix, form?.seqPadLength, preview]);
 
   function buildParts() {

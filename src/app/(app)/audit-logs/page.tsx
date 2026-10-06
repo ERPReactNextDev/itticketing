@@ -10,7 +10,7 @@ import {
   GhostButton,
   TerminalBadge,
 } from "@/components/app-shell";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, ScrollText as ScrollTextIcon } from "lucide-react";
 import { api } from "@/lib/client/api";
 import type { AuditLog } from "@/lib/client/types";
 import { formatDateTime } from "@/lib/shared/format";
@@ -67,6 +67,10 @@ export default function AuditLogsPage() {
     return () => clearTimeout(timer);
   }, [load]);
 
+  React.useEffect(() => {
+    document.title = "Audit Logs — Help Desk";
+  }, []);
+
   function toggleMeta(id: string) {
     setExpanded((current) => {
       const next = new Set(current);
@@ -100,7 +104,7 @@ export default function AuditLogsPage() {
               Loading…
             </p>
           ) : logs.length === 0 ? (
-            <EmptyState title="No audit entries" description="Actions will appear here as they happen." />
+            <EmptyState title="No audit entries" description="Actions will appear here as they happen." icon={ScrollTextIcon} />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[900px] text-left">
@@ -115,9 +119,9 @@ export default function AuditLogsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {logs.map((log) => (
-                    <>
-                      <tr key={log.id} className="border-b border-border/60 hover:bg-muted/40">
+                {logs.map((log) => (
+                    <React.Fragment key={log.id}>
+                      <tr className="border-b border-border/60 hover:bg-muted/40">
                         <td className="whitespace-nowrap px-3 py-2.5 text-[10px] text-muted-foreground">
                           {formatDateTime(log.createdAt)}
                         </td>
@@ -166,7 +170,7 @@ export default function AuditLogsPage() {
                           </td>
                         </tr>
                       ) : null}
-                    </>
+                    </React.Fragment>
                   ))}
                 </tbody>
               </table>
