@@ -13,8 +13,8 @@ import {
   AlertBanner,
 } from "@/components/app-shell";
 import { LabeledField, TextInput, Select, ACCENT } from "@/components/ui/primitives";
-import { UserPlus, Pencil, X, KeyRound, Check, UserCog as UserCogIcon } from "lucide-react";
-import { api } from "@/lib/client/api";
+import { UserPlus, Pencil, X, KeyRound, Check, UserCog as UserCogIcon, UserCheck } from "lucide-react";
+import { api, ApiError } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
 import type { Role, StaffUser } from "@/lib/client/types";
 import { formatDateTime } from "@/lib/shared/format";
@@ -34,11 +34,16 @@ export default function StaffDirectoryPage() {
   const [search, setSearch] = React.useState("");
   const [debouncedSearch, setDebouncedSearch] = React.useState("");
   const [statusFilter, setStatusFilter] = React.useState("");
+  const [departmentFilter, setDepartmentFilter] = React.useState("");
+  const [departments, setDepartments] = React.useState<string[]>([]);
+  const [addedToRequestors, setAddedToRequestors] = React.useState<Set<string>>(new Set());
+  const [addingRequestor, setAddingRequestor] = React.useState<string | null>(null);
   const [editing, setEditing] = React.useState<StaffUser | null>(null);
   const [creating, setCreating] = React.useState(false);
   const [resetting, setResetting] = React.useState<StaffUser | null>(null);
 
   const canManage = user?.permissions.manageUsers;
+  const canAddRequestor = user?.permissions.manageRequestors;
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -46,6 +51,7 @@ export default function StaffDirectoryPage() {
       const params = new URLSearchParams();
       if (debouncedSearch.trim()) params.set("search", debouncedSearch.trim());
       if (statusFilter) params.set("status", statusFilter);
+      if (departmentFilter) params.set("department", departmentFilter);
       params.set("page", String(page));
       params.set("pageSize", "25");
       const response = await api.get<{
@@ -62,7 +68,7 @@ export default function StaffDirectoryPage() {
     } finally {
       setLoading(false);
     }
-  }, [debouncedSearch, statusFilter, page]);
+  }, [debouncedSearch, statusFilter, departmentFilter, page]);
 
   // Debounce search input only.
   React.useEffect(() => {
@@ -89,6 +95,58 @@ export default function StaffDirectoryPage() {
       }
     })();
   }, []);
+
+  // Departments are free text on the account rows, so the filter options come
+  // from the values actually in use rather than from the dropdown list.
+  React.useEffect(() => {
+    void (async () => {
+      try {
+        const response = await api.get<{ departments: string[] }>("/api/users?facets=1");
+        setDepartments(response.departments ?? []);
+      } catch {
+        setDepartments([]);
+      }
+    })();
+  }, []);
+
+  /**
+   * Copies a login account into the requestor directory.
+   *
+   * The account list is deliberately not reloaded: this row does not change,
+   * and skipping the fetch keeps the agent on the page they were working on
+   * (page 4 stays page 4) instead of jumping back to the start.
+   */
+  async function addToRequestor(account: StaffUser) {
+    setError(null);
+    setAddingRequestor(account.id);
+    try {
+      const [first, ...rest] = account.name.trim().split(/\s+/);
+      await api.post("/api/requestors", {
+        employeeId: account.employeeId || account.email,
+        firstName: first ?? "",
+        lastName: rest.join(" "),
+        email: account.email,
+        department: account.department,
+        site: account.site,
+        phone: account.phone,
+        status: "active",
+        notes: `Copied from the staff directory (${account.roleName}).`,
+      });
+      setAddedToRequestors((current) => new Set(current).add(account.id));
+      setNotice(`${account.name} was added to the requestor directory.`);
+    } catch (caught) {
+      // An entry for this employee already exists, which is the state we wanted
+      // anyway, so report it as done instead of as a failure.
+      if (caught instanceof ApiError && caught.code === "duplicate") {
+        setAddedToRequestors((current) => new Set(current).add(account.id));
+        setNotice(`${account.name} is already in the requestor directory.`);
+      } else {
+        setError(caught);
+      }
+    } finally {
+      setAddingRequestor(null);
+    }
+  }
 
   async function toggleSuspended(account: StaffUser, next: boolean) {
     setError(null);
@@ -170,6 +228,13 @@ export default function StaffDirectoryPage() {
 
         <Panel title="Accounts" hint={`${total} account${total === 1 ? "" : "s"}`}>
           <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
+            <TextInput
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search name, email, employee ID"
+              aria-label="Search accounts"
+              className="h-8 w-full sm:w-64"
+            />
             <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-muted-foreground">
               Status
             </span>
@@ -184,6 +249,24 @@ export default function StaffDirectoryPage() {
               <option value="">All</option>
               <option value="active">Active</option>
               <option value="suspended">Suspended</option>
+            </Select>
+            <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-muted-foreground">
+              Department
+            </span>
+            <Select
+              className="h-8 w-52"
+              value={departmentFilter}
+              onChange={(event) => {
+                setDepartmentFilter(event.target.value);
+                setPage(1);
+              }}
+            >
+              <option value="">All</option>
+              {departments.map((department) => (
+                <option key={department} value={department}>
+                  {department}
+                </option>
+              ))}
             </Select>
           </div>
 
@@ -205,7 +288,7 @@ export default function StaffDirectoryPage() {
                     <Th>Site</Th>
                     <Th>Status</Th>
                     <Th>Last Sign-In</Th>
-                    {canManage ? <Th>Actions</Th> : null}
+                    {canManage || canAddRequestor ? <Th>Actions</Th> : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -240,36 +323,60 @@ export default function StaffDirectoryPage() {
                       <td className="whitespace-nowrap px-3 py-2.5 text-[10px] text-muted-foreground">
                         {account.lastLoginAt ? formatDateTime(account.lastLoginAt) : "Never"}
                       </td>
-                      {canManage ? (
+                      {canManage || canAddRequestor ? (
                         <td className="px-3 py-2.5">
                           <div className="flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => setEditing(account)}
-                              className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                              title="Edit"
-                            >
-                              <Pencil className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setResetting(account)}
-                              className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                              title="Reset password"
-                            >
-                              <KeyRound className="h-3.5 w-3.5" />
-                            </button>
-                            {account.id !== user?.id ? (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void toggleSuspended(account, account.status === "active")
-                                }
-                                className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                                title={account.status === "active" ? "Suspend" : "Reactivate"}
-                              >
-                                <X className="h-3.5 w-3.5" />
-                              </button>
+                            {canAddRequestor ? (
+                              addedToRequestors.has(account.id) ? (
+                                <span
+                                  className="rounded p-1.5 text-emerald-600"
+                                  title="Already in the requestor directory"
+                                >
+                                  <UserCheck className="h-3.5 w-3.5" />
+                                </span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => void addToRequestor(account)}
+                                  disabled={addingRequestor === account.id}
+                                  className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
+                                  title="Add to requestors"
+                                >
+                                  <UserPlus className="h-3.5 w-3.5" />
+                                </button>
+                              )
+                            ) : null}
+                            {canManage ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditing(account)}
+                                  className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                                  title="Edit"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setResetting(account)}
+                                  className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                                  title="Reset password"
+                                >
+                                  <KeyRound className="h-3.5 w-3.5" />
+                                </button>
+                                {account.id !== user?.id ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      void toggleSuspended(account, account.status === "active")
+                                    }
+                                    className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                                    title={account.status === "active" ? "Suspend" : "Reactivate"}
+                                  >
+                                    <X className="h-3.5 w-3.5" />
+                                  </button>
+                                ) : null}
+                              </>
                             ) : null}
                           </div>
                         </td>

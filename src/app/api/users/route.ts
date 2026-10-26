@@ -68,9 +68,32 @@ export const GET = withApi(async (req: Request) => {
   const search = (url.searchParams.get("search") ?? "").trim();
   const statuses = csvParam(url.searchParams.get("status"));
   const roleIds = csvParam(url.searchParams.get("roleId"));
+  const departments = csvParam(url.searchParams.get("department"));
 
   const page = intParam(url.searchParams.get("page"), 1, { min: 1 });
   const pageSize = intParam(url.searchParams.get("pageSize"), 25, { min: 1, max: 200 });
+
+  // `Department` is free text on the legacy table, so the filter list has to be
+  // read back from the rows themselves - the dropdown options are slugs and
+  // would never match what is actually stored here.
+  if (url.searchParams.get("facets") === "1") {
+    let facetQuery = supabase.from("users").select("Department").limit(2000);
+    if (!user.permissions.manageUsers) facetQuery = facetQuery.eq("id", Number(user.id));
+
+    const { data, error } = await facetQuery;
+    if (error) throw new DatabaseError(error);
+
+    const rows = (data ?? []) as unknown as Row[];
+    const departmentsInUse = new Map<string, number>();
+    for (const row of rows) {
+      const value = sanitizeTerm(String(row.Department ?? "")).trim();
+      if (value) departmentsInUse.set(value, (departmentsInUse.get(value) ?? 0) + 1);
+    }
+
+    return NextResponse.json({
+      departments: [...departmentsInUse.keys()].sort((a, b) => a.localeCompare(b)),
+    });
+  }
 
   let q = supabase.from("users").select("*", { count: "exact" });
 
@@ -93,6 +116,13 @@ export const GET = withApi(async (req: Request) => {
     // match case-insensitively rather than on an exact value.
     const clauses = statuses.map((s) => sanitizeTerm(s)).filter(Boolean);
     if (clauses.length) q = q.or(clauses.map((s) => `Status.ilike.${s}`).join(","));
+  }
+
+  // Same free-text reasoning as `Status`; a trailing `%` is appended so a stored
+  // value with stray whitespace ("Accounting ") still matches its trimmed form.
+  if (departments.length) {
+    const clauses = departments.map((d) => sanitizeTerm(d)).filter(Boolean);
+    if (clauses.length) q = q.or(clauses.map((d) => `Department.ilike.${d}%`).join(","));
   }
 
   const numericRoleIds = roleIds.map(Number).filter(Number.isFinite);

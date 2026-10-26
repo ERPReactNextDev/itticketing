@@ -3,7 +3,8 @@ import { connectDB, DatabaseError } from "@/lib/db/supabase";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { loadTicketDTO } from "@/lib/server/ticket-query";
 import { appendRemark } from "@/lib/server/tickets";
-import { sendTicketReply, buildTicketSubject } from "@/lib/server/resend";
+import { sendTicketReply, buildTicketSubject, type EmailAttachment } from "@/lib/server/resend";
+import { storeBuffer, deleteFile } from "@/lib/server/storage";
 import { getSettings } from "@/lib/server/settings";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
@@ -64,6 +65,39 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
   const originalSubject = body.subject ?? ticket.subject ?? "";
   const subject = buildTicketSubject(ticket.ticketNumber, originalSubject);
 
+  // Attachments are stored first so the same file both goes out with the email
+  // and stays attached to the ticket afterwards. A rejected upload (wrong type
+  // or too large) fails the request before anything is sent.
+  const storedIds: string[] = [];
+  const outgoing: EmailAttachment[] = [];
+  for (const attachment of body.attachments ?? []) {
+    if (!attachment?.content) continue;
+    try {
+      const buffer = Buffer.from(attachment.content, "base64");
+      const stored = await storeBuffer({
+        buffer,
+        filename: attachment.filename || "attachment",
+        contentType: attachment.contentType || "application/octet-stream",
+        tags: { ticket: String(ticket.id) },
+      });
+      storedIds.push(stored.fileId);
+      outgoing.push({
+        filename: stored.filename,
+        content: buffer,
+        contentType: stored.contentType,
+      });
+    } catch (error) {
+      await Promise.all(storedIds.map((fileId) => deleteFile(fileId)));
+      return NextResponse.json(
+        {
+          error: "invalid_attachment",
+          message: error instanceof Error ? error.message : "Attachment upload failed.",
+        },
+        { status: 400 },
+      );
+    }
+  }
+
   const result = await sendTicketReply({
     ticketNumber: ticket.ticketNumber,
     subject: originalSubject,
@@ -72,9 +106,12 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
     ticketId: String(ticket.id),
     threadId: ticket.emailThreadId,
     cc: body.cc ?? [],
+    attachments: outgoing,
   });
 
   if (!result.ok) {
+    // The email never left, so the stored copies would only become orphans.
+    await Promise.all(storedIds.map((fileId) => deleteFile(fileId)));
     await writeAuditLog({
       actorId: user.id,
       actorName: user.name,
@@ -107,6 +144,7 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
     cc_addresses: body.cc ?? [],
     subject,
     text_body: text,
+    attachments: storedIds,
     processed_at: new Date().toISOString(),
     auto_created_ticket: false,
   });
@@ -119,6 +157,7 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
     content: text,
     authorName: user.name,
     authorRef: user.id,
+    attachments: storedIds,
     emailMessageId: messageId,
   });
 
@@ -131,14 +170,17 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
     entityId: String(ticket.id),
     ip: clientIp(req),
     userAgent: userAgent(req),
-    meta: { ticketNumber: ticket.ticketNumber, to },
+    meta: { ticketNumber: ticket.ticketNumber, to, attachments: storedIds.length },
   });
 
   return NextResponse.json({
     ok: true,
     messageId,
     subject,
-    message: `Reply sent to ${to.join(", ")}.`,
+    attachments: storedIds.length,
+    message: `Reply sent to ${to.join(", ")}${
+      storedIds.length > 0 ? ` with ${storedIds.length} attachment(s)` : ""
+    }.`,
   });
 });
 

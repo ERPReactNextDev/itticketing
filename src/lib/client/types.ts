@@ -1,4 +1,4 @@
-﻿/** Client-side view models shared across pages. */
+/** Client-side view models shared across pages. */
 
 export type PermissionKey =
   | "manageUsers"
@@ -205,6 +205,7 @@ export type DashboardData = {
   byPriority: Array<{ key: string; count: number }>;
   byTechnician: Array<{ name: string; count: number }>;
   byDepartment: Array<{ key: string; count: number }>;
+  byRequestor: Array<{ name: string; count: number }>;
   atRiskTickets: Array<{
     id: string;
     ticketNumber: string;

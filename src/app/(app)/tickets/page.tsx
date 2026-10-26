@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import * as React from "react";
 import Link from "next/link";
@@ -166,7 +166,9 @@ function TicketsView() {
         if (dateTo) {
           const d = fromDateInputValue(dateTo);
           if (d) {
-            d.setUTCHours(23, 59, 59, 999);
+            // fromDateInputValue returns local midnight. To get local end-of-day,
+            // we add 24 hours (minus 1ms).
+            d.setTime(d.getTime() + 24 * 60 * 60 * 1000 - 1);
             params.set("to", d.toISOString());
           }
         }

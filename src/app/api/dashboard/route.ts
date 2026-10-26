@@ -1,4 +1,4 @@
-﻿import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { connectDB, DatabaseError } from "@/lib/db/supabase";
 import { asRecord, composeUserName, num, str } from "@/lib/db/mappers";
 import { requireUser, requirePermission } from "@/lib/auth/session";
@@ -19,6 +19,9 @@ const TICKET_COLUMNS = [
   "priority",
   "priority_data",
   "department",
+  "requestor_name",
+  "processed_by",
+  "processed_by_id",
   "technician_id",
   "technician_name",
   "source",
@@ -28,6 +31,9 @@ const TICKET_COLUMNS = [
   "date_created",
   "duration_seconds",
 ].join(", ");
+
+/** Rows per round trip while paging through the selected range. */
+const ROW_PAGE_SIZE = 1000;
 
 /**
  * Dashboard aggregates.
@@ -46,20 +52,30 @@ export const GET = withApi(async (req: Request) => {
   const from = parseDate(url.searchParams.get("from"));
   const to = parseDate(url.searchParams.get("to"));
 
-  let query = supabase.from("tickets").select(TICKET_COLUMNS);
-  if (from) query = query.gte("date_created", from.toISOString());
-  if (to) query = query.lte("date_created", to.toISOString());
+  // PostgREST caps a single response, so a wide range is paged in rather than
+  // silently truncated - the aggregates must cover every ticket in the range.
+  const rows: Row[] = [];
+  for (let offset = 0; ; offset += ROW_PAGE_SIZE) {
+    let query = supabase.from("tickets").select(TICKET_COLUMNS);
+    if (from) query = query.gte("date_created", from.toISOString());
+    if (to) query = query.lte("date_created", to.toISOString());
 
-  // Respect the same visibility rule as the ticket list.
-  if (!user.permissions.viewAllTickets) {
-    query = query.or(`technician_id.eq.${user.id},processed_by_id.eq.${user.id}`);
+    // Respect the same visibility rule as the ticket list.
+    if (!user.permissions.viewAllTickets) {
+      query = query.or(`technician_id.eq.${user.id},processed_by_id.eq.${user.id}`);
+    }
+
+    const { data, error } = await query
+      .order("id")
+      .range(offset, offset + ROW_PAGE_SIZE - 1);
+    if (error) throw new DatabaseError(error);
+
+    const batch = (data ?? []) as unknown as Row[];
+    rows.push(...batch);
+    if (batch.length < ROW_PAGE_SIZE) break;
   }
 
-  const { data, error } = await query;
-  if (error) throw new DatabaseError(error);
-
   // The client is untyped, so PostgREST rows arrive with an opaque shape.
-  const rows = (data ?? []) as unknown as Row[];
   const isClosed = (row: Row) => CLOSED_STATUS_VALUES.includes(str(row.status).toLowerCase());
 
   const openRows = rows.filter((row) => !isClosed(row));
@@ -69,12 +85,22 @@ export const GET = withApi(async (req: Request) => {
   const byPriorityMap = new Map<string, number>();
   const byTechnicianMap = new Map<string, number>();
   const byDepartmentMap = new Map<string, number>();
+  const byRequestorMap = new Map<string, number>();
 
   for (const row of rows) {
     bump(byStatusMap, str(row.status));
     bump(byPriorityMap, str(asRecord(row.priority_data).label) || str(row.priority));
-    bump(byTechnicianMap, row.technician_id ? String(row.technician_id) : "");
+    // Use the linked ID if available, otherwise fallback to name snapshots.
+    // We check both technician and processed-by fields to ensure tickets
+    // migrated from other systems or auto-assigned are counted.
+    const techKey =
+      row.technician_id ? String(row.technician_id) :
+      str(row.technician_name) ||
+      (row.processed_by_id ? String(row.processed_by_id) : str(row.processed_by));
+    bump(byTechnicianMap, techKey);
     bump(byDepartmentMap, str(row.department));
+    // `requestor_name` is the snapshot taken when the ticket was filed.
+    bump(byRequestorMap, str(row.requestor_name));
   }
 
   // SLA health + the tickets closest to breaching, over currently-open tickets.
@@ -149,11 +175,17 @@ export const GET = withApi(async (req: Request) => {
     byStatus: topEntries(byStatusMap, 0).map(([key, count]) => ({ key, count })),
     byPriority: topEntries(byPriorityMap, 0).map(([key, count]) => ({ key, count })),
     byTechnician: topTechnicians.map(([id, count]) => ({
-      name: id ? (technicianNameById.get(id) ?? "Unknown") : "Unassigned",
+      name: id
+        ? technicianNameById.get(id) ?? (Number.isNaN(Number(id)) ? id : "Unknown")
+        : "Unassigned",
       count,
     })),
     byDepartment: topEntries(byDepartmentMap, 12).map(([key, count]) => ({
       key: key || "Unassigned",
+      count,
+    })),
+    byRequestor: topEntries(byRequestorMap, 12).map(([key, count]) => ({
+      name: key || "Unknown requestor",
       count,
     })),
     atRiskTickets,

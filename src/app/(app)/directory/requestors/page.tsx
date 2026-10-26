@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import * as React from "react";
 import { AppPage } from "@/components/app-page";
@@ -45,6 +45,8 @@ export default function RequestorsDirectoryPage() {
   const [search, setSearch] = React.useState("");
   const [debouncedSearch, setDebouncedSearch] = React.useState("");
   const [statusFilter, setStatusFilter] = React.useState("");
+  const [departmentFilter, setDepartmentFilter] = React.useState("");
+  const [departments, setDepartments] = React.useState<Array<{ value: string; label: string }>>([]);
   const [options, setOptions] = React.useState<Record<string, DropdownOption[]>>({});
 
   const [editing, setEditing] = React.useState<Requestor | null>(null);
@@ -61,6 +63,7 @@ export default function RequestorsDirectoryPage() {
       const params = new URLSearchParams();
       if (debouncedSearch.trim()) params.set("search", debouncedSearch.trim());
       if (statusFilter) params.set("status", statusFilter);
+      if (departmentFilter) params.set("department", departmentFilter);
       params.set("page", String(page));
       params.set("pageSize", "25");
       const response = await api.get<{
@@ -78,7 +81,7 @@ export default function RequestorsDirectoryPage() {
     } finally {
       setLoading(false);
     }
-  }, [debouncedSearch, statusFilter, page]);
+  }, [debouncedSearch, statusFilter, departmentFilter, page]);
 
   // Debounce search input changes only.
   React.useEffect(() => {
@@ -104,6 +107,21 @@ export default function RequestorsDirectoryPage() {
         setOptions(response.grouped ?? {});
       } catch {
         setOptions({});
+      }
+    })();
+  }, []);
+
+  // Department values are a mix of dropdown slugs and free text, so the filter
+  // list is read from the directory itself rather than from the dropdown.
+  React.useEffect(() => {
+    void (async () => {
+      try {
+        const response = await api.get<{
+          departments: Array<{ value: string; label: string }>;
+        }>("/api/requestors?facets=1");
+        setDepartments(response.departments ?? []);
+      } catch {
+        setDepartments([]);
       }
     })();
   }, []);
@@ -246,6 +264,13 @@ export default function RequestorsDirectoryPage() {
 
         <Panel title="Directory" hint={`${total} record${total === 1 ? "" : "s"}`}>
           <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
+            <TextInput
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search name, email, employee ID"
+              aria-label="Search requestors"
+              className="h-8 w-full sm:w-64"
+            />
             <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-muted-foreground">
               Status
             </span>
@@ -261,6 +286,24 @@ export default function RequestorsDirectoryPage() {
               <option value="active">Active</option>
               <option value="inactive">Inactive</option>
             </Select>
+            <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-muted-foreground">
+              Department
+            </span>
+            <Select
+              className="h-8 w-52"
+              value={departmentFilter}
+              onChange={(event) => {
+                setDepartmentFilter(event.target.value);
+                setPage(1);
+              }}
+            >
+              <option value="">All</option>
+              {departments.map((department) => (
+                <option key={department.value} value={department.value}>
+                  {department.label}
+                </option>
+              ))}
+            </Select>
           </div>
 
           {loading ? (
@@ -272,8 +315,8 @@ export default function RequestorsDirectoryPage() {
               title="No requestors found"
               icon={UsersIcon}
               description={
-                search
-                  ? "Try a different search."
+                search || departmentFilter || statusFilter
+                  ? "Try a different search or filter."
                   : "Import a CSV or add someone manually to populate the list."
               }
             />

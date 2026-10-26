@@ -53,6 +53,15 @@ function sanitizeTerm(value: string): string {
   return value.replace(/[(),%]/g, " ").trim();
 }
 
+/**
+ * `department` mixes dropdown slugs (`warehouse-operations`) with free text
+ * (`Warehouse Operations`) for the same department, so values are grouped by a
+ * separator-insensitive key and the filter expands back to every stored variant.
+ */
+function departmentKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_-]+/g, " ");
+}
+
 /** `full_name / first_name / last_name / email / employee_id / phone` ILIKE. */
 function searchClause(raw: string, columns: string[]): string | null {
   const term = sanitizeTerm(raw);
@@ -118,6 +127,46 @@ export const GET = withApi(async (req: Request) => {
   const statuses = csvParam(url.searchParams.get("status"));
   const departments = csvParam(url.searchParams.get("department"));
 
+  // `department` mixes dropdown slugs (written by the form) with free text (CSV
+  // imports and staff copies), so the filter list is read back from the rows
+  // themselves, grouped by `departmentKey`, and each group is labelled with its
+  // dropdown name when known.
+  if (url.searchParams.get("facets") === "1") {
+    const { data, error } = await supabase.from("requestors").select("department").limit(3000);
+    if (error) throw new DatabaseError(error);
+
+    const { data: optionRows } = await supabase
+      .from("dropdown_options")
+      .select("label, value")
+      .eq("type", "department");
+    const labelByValue = new Map(
+      ((optionRows ?? []) as Row[]).map((option) => [
+        String(option.value ?? "").toLowerCase(),
+        String(option.label ?? ""),
+      ]),
+    );
+
+    const groups = new Map<string, { value: string; label: string }>();
+    for (const row of (data ?? []) as Row[]) {
+      const raw = String(row.department ?? "").trim();
+      const key = departmentKey(raw);
+      if (!key) continue;
+      const dropdownLabel = labelByValue.get(raw.toLowerCase());
+      const seen = groups.get(key);
+      if (!seen) {
+        groups.set(key, { value: raw, label: dropdownLabel ?? raw });
+      } else if (dropdownLabel && !labelByValue.has(seen.value.toLowerCase())) {
+        // Prefer the dropdown's own value/label as the canonical option.
+        seen.value = raw;
+        seen.label = dropdownLabel;
+      }
+    }
+
+    return NextResponse.json({
+      departments: [...groups.values()].sort((a, b) => a.label.localeCompare(b.label)),
+    });
+  }
+
   const page = intParam(url.searchParams.get("page"), 1, { min: 1 });
   const pageSize = intParam(url.searchParams.get("pageSize"), 25, { min: 1, max: 200 });
 
@@ -125,7 +174,29 @@ export const GET = withApi(async (req: Request) => {
   const clause = searchClause(search, ["full_name", "first_name", "last_name", "email", "employee_id", "phone"]);
   if (clause) query = query.or(clause);
   if (statuses.length) query = query.in("status", statuses);
-  if (departments.length) query = query.in("department", departments);
+  // Prefix match, case-insensitive, so a stored "Sales" and the dropdown slug
+  // "sales" are filtered as the same department. Because both spellings exist in
+  // the table, every stored variant of the selected department is included.
+  if (departments.length) {
+    const wanted = new Set(departments.map(departmentKey).filter(Boolean));
+    const { data: valueRows } = await supabase.from("requestors").select("department").limit(3000);
+    const variants = new Set<string>();
+    for (const row of (valueRows ?? []) as Row[]) {
+      const raw = String(row.department ?? "").trim();
+      const term = sanitizeTerm(raw);
+      if (term && wanted.has(departmentKey(raw))) variants.add(term);
+    }
+    // Fall back to the requested values when nothing in the table matches yet.
+    if (!variants.size) {
+      for (const value of departments) {
+        const term = sanitizeTerm(value);
+        if (term) variants.add(term);
+      }
+    }
+    if (variants.size) {
+      query = query.or([...variants].map((d) => `department.ilike.${d}%`).join(","));
+    }
+  }
 
   const { data, count, error } = await query
     .order("full_name")

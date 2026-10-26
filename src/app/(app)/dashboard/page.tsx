@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import * as React from "react";
 import { AppPage } from "@/components/app-page";
@@ -10,6 +10,7 @@ import {
   ErrorNote,
   EmptyState,
   AlertBanner,
+  GhostButton,
 } from "@/components/app-shell";
 import {
   CheckCircle2,
@@ -20,10 +21,12 @@ import {
   Ticket as TicketIcon,
   Users,
   Building2,
+  CalendarRange,
 } from "lucide-react";
 import { api } from "@/lib/client/api";
+import { TextInput } from "@/components/ui/primitives";
 import type { DashboardData } from "@/lib/client/types";
-import { formatDuration } from "@/lib/shared/format";
+import { formatDuration, fromDateInputValue, toDateInputValue } from "@/lib/shared/format";
 import { cn } from "@/lib/utils";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -40,11 +43,28 @@ export default function DashboardPage() {
   const [error, setError] = React.useState<unknown>(null);
   const [loading, setLoading] = React.useState(true);
 
+  // Defaults to today; widening the range re-reads every ticket in it, however
+  // far back it starts.
+  const today = React.useMemo(() => toDateInputValue(new Date()), []);
+  const [dateFrom, setDateFrom] = React.useState(today);
+  const [dateTo, setDateTo] = React.useState(today);
+
   React.useEffect(() => {
     let cancelled = false;
     async function load() {
+      setLoading(true);
       try {
-        const response = await api.get<DashboardData>("/api/dashboard");
+        const params = new URLSearchParams();
+        const fromDate = fromDateInputValue(dateFrom);
+        if (fromDate) params.set("from", fromDate.toISOString());
+        const toDate = fromDateInputValue(dateTo);
+        if (toDate) {
+          // fromDateInputValue returns local midnight. To get local end-of-day,
+          // we add 24 hours (minus 1ms).
+          toDate.setTime(toDate.getTime() + 24 * 60 * 60 * 1000 - 1);
+          params.set("to", toDate.toISOString());
+        }
+        const response = await api.get<DashboardData>(`/api/dashboard?${params}`);
         if (!cancelled) setData(response);
       } catch (caught) {
         if (!cancelled) setError(caught);
@@ -56,7 +76,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [dateFrom, dateTo]);
 
   React.useEffect(() => {
     document.title = "Dashboard — Help Desk";
@@ -75,6 +95,7 @@ export default function DashboardPage() {
 
   const maxTechnician = Math.max(1, ...(data?.byTechnician ?? []).map((row) => row.count));
   const maxDepartment = Math.max(1, ...(data?.byDepartment ?? []).map((row) => row.count));
+  const maxRequestor = Math.max(1, ...(data?.byRequestor ?? []).map((row) => row.count));
 
   // "Unassigned" is a bucket, not an agent, so it must not inflate the count.
   const assignedAgents = (data?.byTechnician ?? []).filter((row) => row.name !== "Unassigned").length;
@@ -88,6 +109,46 @@ export default function DashboardPage() {
 
       <div className="space-y-4">
         <ErrorNote error={error} />
+
+        {/* Every figure on this page is scoped to the selected range. */}
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-background px-3 py-2.5">
+          <span className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.15em] text-muted-foreground">
+            <CalendarRange className="h-3.5 w-3.5" />
+            Date range
+          </span>
+          <TextInput
+            type="date"
+            value={dateFrom}
+            max={dateTo || undefined}
+            onChange={(event) => setDateFrom(event.target.value)}
+            aria-label="From date"
+            className="h-8 w-40"
+          />
+          <span className="text-[11px] text-muted-foreground">to</span>
+          <TextInput
+            type="date"
+            value={dateTo}
+            min={dateFrom || undefined}
+            onChange={(event) => setDateTo(event.target.value)}
+            aria-label="To date"
+            className="h-8 w-40"
+          />
+          <GhostButton
+            className="h-8"
+            onClick={() => {
+              setDateFrom(today);
+              setDateTo(today);
+            }}
+            disabled={dateFrom === today && dateTo === today}
+          >
+            Today
+          </GhostButton>
+          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            {loading
+              ? "Loading…"
+              : `${totals?.all ?? 0} ticket${(totals?.all ?? 0) === 1 ? "" : "s"} in range`}
+          </span>
+        </div>
 
         {/* SLA alerting - the single most important thing on this page. */}
         {totals && totals.breached > 0 ? (
@@ -217,8 +278,8 @@ export default function DashboardPage() {
         </div>
 
         {/* Load-balanced charts */}
-        <div className="grid gap-4 xl:grid-cols-2">
-          <Panel title="Tickets per Technician" hint="Based on processed counts">
+        <div className="grid gap-4 xl:grid-cols-3">
+          <Panel title="Tickets per Technician" hint="Based on processed and assigned counts">
             {loading ? (
               <p className="px-4 py-8 text-center text-[11px] text-muted-foreground">Loading…</p>
             ) : data?.byTechnician.length ? (
@@ -234,6 +295,36 @@ export default function DashboardPage() {
                         style={{
                           width: `${(row.count / maxTechnician) * 100}%`,
                           backgroundColor: "#f97316",
+                        }}
+                      />
+                    </span>
+                    <span className="w-8 shrink-0 text-right text-[11px] font-bold tabular-nums">
+                      {row.count}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <EmptyState title="No tickets yet" />
+            )}
+          </Panel>
+
+          <Panel title="Tickets per Requestor" hint="Who files the most tickets">
+            {loading ? (
+              <p className="px-4 py-8 text-center text-[11px] text-muted-foreground">Loading…</p>
+            ) : data?.byRequestor.length ? (
+              <ul className="space-y-2.5 p-4">
+                {data.byRequestor.map((row) => (
+                  <li key={row.name} className="flex items-center gap-3">
+                    <span className="w-36 shrink-0 truncate text-[10px] uppercase tracking-wider text-muted-foreground">
+                      {row.name}
+                    </span>
+                    <span className="h-2.5 flex-1 overflow-hidden rounded-full bg-muted">
+                      <span
+                        className="block h-full rounded-full"
+                        style={{
+                          width: `${(row.count / maxRequestor) * 100}%`,
+                          backgroundColor: "#8b5cf6",
                         }}
                       />
                     </span>

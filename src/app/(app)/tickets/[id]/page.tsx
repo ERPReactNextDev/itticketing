@@ -37,6 +37,7 @@ import {
   Flag,
   FileText,
   StickyNote,
+  X,
 } from "lucide-react";
 import { api, ApiError } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
@@ -75,6 +76,57 @@ const REMARK_LABEL: Record<string, string> = {
   system: "System",
 };
 
+/**
+ * Ready-made reply body, pre-filled when the composer opens.
+ *
+ * It carries the ticket's own details in the message, so the requestor always
+ * sees which ticket is being answered even in a long inbox thread. The blank
+ * lines under the opening sentence are where the agent writes the actual update.
+ */
+function buildReplyTemplate(ticket: Ticket, agentName: string): string {
+  const firstName = ticket.requestorName.split(",")[0]?.trim();
+  return [
+    `Hi ${firstName || "there"},`,
+    ``,
+    `Thank you for contacting the IT Help Desk. Here is the latest update on your ticket:`,
+    ``,
+    ``,
+    `Ticket details`,
+    `  Ticket No.  : ${ticket.ticketNumber}`,
+    `  Subject     : ${ticket.subject}`,
+    `  Status      : ${ticket.statusLabel || ticket.status}`,
+    `  Priority    : ${ticket.priority.label || "—"}`,
+    `  Technician  : ${ticket.technicianName || "Unassigned"}`,
+    ``,
+    `If you have additional information, simply reply to this email and it will be`,
+    `added to your ticket.`,
+    ``,
+    `Regards,`,
+    agentName,
+    `IT Help Desk`,
+  ].join("\n");
+}
+
+/** Reads a picked file as the base64 payload the API expects. */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      // Strip the `data:<type>;base64,` prefix - only the payload is sent.
+      resolve(result.slice(result.indexOf(",") + 1));
+    };
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 export default function TicketDetailPage() {
   const params = useParams<{ id: string }>();
   const id = params?.id ?? "";
@@ -93,6 +145,8 @@ export default function TicketDetailPage() {
   const [note, setNote] = React.useState("");
   const [reply, setReply] = React.useState("");
   const [replyTo, setReplyTo] = React.useState("");
+  const [replyFiles, setReplyFiles] = React.useState<File[]>([]);
+  const replyFileInput = React.useRef<HTMLInputElement | null>(null);
   const [sending, setSending] = React.useState(false);
   const [showReply, setShowReply] = React.useState(false);
 
@@ -178,13 +232,26 @@ export default function TicketDetailPage() {
     setSending(true);
     setError(null);
     try {
+      const attachments = await Promise.all(
+        replyFiles.map(async (file) => ({
+          filename: file.name,
+          contentType: file.type || "application/octet-stream",
+          content: await fileToBase64(file),
+        })),
+      );
       await api.post(`/api/tickets/${id}/reply`, {
         body: reply.trim(),
         to: replyTo,
+        attachments,
       });
       setReply("");
+      setReplyFiles([]);
       setShowReply(false);
-      setNotice("Reply sent.");
+      setNotice(
+        attachments.length > 0
+          ? `Reply sent with ${attachments.length} attachment(s).`
+          : "Reply sent.",
+      );
       await load();
     } catch (caught) {
       setError(caught);
@@ -229,6 +296,19 @@ export default function TicketDetailPage() {
   const canReopen = user?.permissions.reopenTicket;
   const canReply = user?.permissions.sendEmailReply;
 
+  /**
+   * Opens the composer with the ready-made reply body already in place.
+   *
+   * Only an empty box is filled, so reopening after a cancel keeps whatever the
+   * agent had typed instead of resetting their work.
+   */
+  const openReply = () => {
+    setShowReply(true);
+    setReply((current) =>
+      current.trim() ? current : buildReplyTemplate(ticket, user?.name ?? "IT Help Desk"),
+    );
+  };
+
   return (
     <AppPage>
       {/* Header */}
@@ -265,7 +345,7 @@ export default function TicketDetailPage() {
             Back
           </GhostButton>
           {canReply ? (
-            <GhostButton icon={Send} onClick={() => setShowReply((prev) => !prev)}>
+            <GhostButton icon={Send} onClick={openReply}>
               Reply via Email
             </GhostButton>
           ) : null}
@@ -494,15 +574,73 @@ export default function TicketDetailPage() {
                   </LabeledField>
                   <LabeledField
                     label="Message"
-                    hint={`subject will be [${ticket.ticketNumber}] ${ticket.subject}`}
+                    hint={`template pre-filled · subject will be [${ticket.ticketNumber}] ${ticket.subject}`}
                   >
                     <TextArea
-                      rows={7}
+                      rows={14}
                       value={reply}
                       onChange={(event) => setReply(event.target.value)}
                       placeholder={`Hi ${ticket.requestorName.split(",")[0] || "there"},\n\n`}
                     />
                   </LabeledField>
+
+                  <LabeledField label="Attachments" hint="sent with the email and kept on the ticket">
+                    <div className="space-y-2">
+                      <input
+                        ref={replyFileInput}
+                        type="file"
+                        multiple
+                        className="hidden"
+                        onChange={(event) => {
+                          const picked = Array.from(event.target.files ?? []);
+                          if (picked.length > 0) {
+                            setReplyFiles((current) => [...current, ...picked]);
+                          }
+                          // Reset so picking the same file twice still fires.
+                          event.target.value = "";
+                        }}
+                      />
+                      <GhostButton
+                        type="button"
+                        icon={Paperclip}
+                        onClick={() => replyFileInput.current?.click()}
+                      >
+                        Attach files
+                      </GhostButton>
+
+                      {replyFiles.length > 0 ? (
+                        <ul className="space-y-1">
+                          {replyFiles.map((file, index) => (
+                            <li
+                              key={`${file.name}-${file.size}-${index}`}
+                              className="flex items-center justify-between gap-2 rounded-md border border-border px-2.5 py-1.5"
+                            >
+                              <span className="flex min-w-0 items-center gap-2 text-[11px]">
+                                <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                                <span className="truncate">{file.name}</span>
+                                <span className="shrink-0 text-[9px] text-muted-foreground">
+                                  {formatBytes(file.size)}
+                                </span>
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setReplyFiles((current) =>
+                                    current.filter((_, position) => position !== index),
+                                  )
+                                }
+                                className="shrink-0 text-muted-foreground hover:text-red-600"
+                                aria-label={`Remove ${file.name}`}
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </div>
+                  </LabeledField>
+
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-[10px] text-muted-foreground">
                       Reply-To is the ticketing inbox, so their answer comes back here.
@@ -511,8 +649,8 @@ export default function TicketDetailPage() {
                       <GhostButton type="button" onClick={() => setShowReply(false)}>
                         Cancel
                       </GhostButton>
-                      <PrimaryButton type="submit" icon={Send} disabled={sending}>
-                        {sending ? "Sending…" : "Send"}
+                      <PrimaryButton type="submit" icon={Send} disabled={sending || !reply.trim()}>
+                        {sending ? "Sending…" : replyFiles.length > 0 ? "Send with files" : "Send"}
                       </PrimaryButton>
                     </div>
                   </div>
