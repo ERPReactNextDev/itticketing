@@ -1,0 +1,21 @@
+﻿{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "Dead `buildParts` function left inside `SettingsConfigPage` after the refactor extracted `buildPreviewParts` to module scope. The old function is never called, closes over `preview` state unnecessarily, and will be flagged by `noUnusedLocals` / `no-unused-vars`. Delete lines 154–164 of `settings/page.tsx`.",
+      "file": "src/app/(app)/configuration/settings/page.tsx"
+    },
+    {
+      "severity": "LOW",
+      "description": "Sort indicator in the tickets table always shows `ChevronDown` when a column is active, but there is no ascending/descending toggle in the sort state. The icon implies reversibility that does not exist. Replace with a neutral `ArrowUpDown` icon or add a `sortDir` state.",
+      "file": "src/app/(app)/tickets/page.tsx"
+    },
+    {
+      "severity": "LOW",
+      "description": "`mustChangePassword` redirect fires inside `useEffect`, so the protected page renders once before `router.replace('/profile?force=1')` executes. Move the guard to `middleware.ts` to issue the redirect server-side before any HTML is sent.",
+      "file": "src/app/(app)/layout.tsx"
+    }
+  ],
+  "reviewDoc": "c:\\Users\\emcee\\OneDrive\\Desktop\\Software Applications\\ERP Modules\\IT-Ticketing\\.agents\\tasks\\review.md"
+}

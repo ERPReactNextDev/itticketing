@@ -1,9 +1,10 @@
-/**
+﻿/**
  * Minimal .env.local loader for standalone scripts.
  *
  * Next.js loads .env files itself, but `tsx` does not, and these scripts read
- * MONGODB_URI / JWT_SECRET / RESEND_* directly. Values already present in the
- * real environment always win, so CI can inject secrets without a file.
+ * SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / JWT_SECRET / RESEND_* directly.
+ * Values already present in the real environment always win, so CI can inject
+ * secrets without a file.
  */
 
 import { readFileSync, existsSync } from "fs";

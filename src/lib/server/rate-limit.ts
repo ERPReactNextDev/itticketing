@@ -1,23 +1,23 @@
-import "server-only";
+﻿import "server-only";
 import { createHash } from "crypto";
 import { NextResponse } from "next/server";
-import { connectDB, DB_NAME } from "../db/mongoose";
-import { RateLimit } from "../models/rate-limit";
+import { connectDB, DB_NAME } from "../db/supabase";
 import { getRateLimits } from "./settings";
 
 /**
- * Mongo-backed fixed-window rate limiter.
+ * Postgres-backed fixed-window rate limiter.
  *
- * Why not express-rate-limit + rate-limit-mongo: those packages are written for
+ * Why not express-rate-limit + a store adapter: those packages are written for
  * Express middleware and expect `req.headers` to be a plain object. Next.js
  * route handlers receive a Web `Request` whose `headers` is a `Headers`
  * instance, so the library's own key generator and request handling silently
  * misbehave behind App Router. This module does the same job with the correct
- * types and no casts, against the same `rate_limits` collection and TTL index.
+ * types and no casts, against the `rate_limits` table.
  *
- * Each window is its own document keyed `key + windowStart`, so concurrent
- * increments are atomic via a single `$inc` and the collection self-prunes when
- * the TTL index expires each window.
+ * Each window is its own row keyed `(key, window_start)`. The increment happens
+ * inside the `consume_rate_limit()` SQL function, so concurrent requests are
+ * atomic - `insert ... on conflict do update ... returning` - instead of the
+ * read-then-write race a client-side increment would create.
  */
 
 export type LimitRule = {
@@ -71,22 +71,18 @@ export async function consume(rule: LimitRule): Promise<LimitResult> {
   const resetAt = windowStart + windowMs;
 
   try {
-    await connectDB();
+    const supabase = await connectDB();
 
-    await RateLimit.updateOne(
-      { key: rule.key, windowStart },
-      {
-        $inc: { totalHits: 1 },
-        $setOnInsert: { key: rule.key, windowStart },
-      },
-      { upsert: true },
-    );
+    // One atomic round-trip: the SQL function increments (or creates) the
+    // bucket and returns the new hit count, so two concurrent requests can
+    // never both read the same value.
+    const { data, error } = await supabase.rpc("consume_rate_limit", {
+      p_key: rule.key,
+      p_window_start: windowStart,
+    });
+    if (error) throw error;
 
-    const doc = await RateLimit.findOne({ key: rule.key, windowStart })
-      .select("totalHits")
-      .lean<{ totalHits: number }>();
-
-    const hits = doc?.totalHits ?? 1;
+    const hits = Number(data ?? 1);
 
     return {
       allowed: hits <= rule.max,
@@ -131,7 +127,7 @@ export async function enforce(rule: LimitRule): Promise<NextResponse | null> {
   );
 }
 
-/* ── Concrete rules, with thresholds read live from system_settings ───────── */
+/* ── Concrete rules, with thresholds read live from app_settings ─────────── */
 
 /** 100 req/min per IP across the API. Applied by the app-shell middleware. */
 export async function globalApiRule(req: Request): Promise<LimitRule> {
@@ -192,8 +188,8 @@ export async function webhookRule(req: Request): Promise<LimitRule> {
 /** Clears a bucket, e.g. after a successful login. */
 export async function resetBucket(key: string): Promise<void> {
   try {
-    await connectDB();
-    await RateLimit.deleteMany({ key });
+    const supabase = await connectDB();
+    await supabase.from("rate_limits").delete().eq("key", key);
   } catch {
     // Non-critical.
   }

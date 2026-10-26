@@ -1,4 +1,4 @@
-import "server-only";
+﻿import "server-only";
 import { CLOSED_STATUS_VALUES } from "../shared/constants";
 import { computeSla, slaBand, SLA_BAND_STYLES } from "./sla";
 
@@ -143,7 +143,7 @@ export function toTicketDTO(doc: Record<string, unknown>): TicketDTO {
   const priority = (doc.priority ?? {}) as Record<string, unknown>;
 
   const remarks = ((doc.remarks ?? []) as Array<Record<string, unknown>>).map((remark) => ({
-    id: String(remark._id ?? ""),
+    id: String(remark.id ?? remark._id ?? ""),
     type: String(remark.type ?? "note"),
     authorName: String(remark.authorName ?? ""),
     authorRef: remark.authorRef ? String(remark.authorRef) : null,
@@ -189,11 +189,13 @@ export function toTicketDTO(doc: Record<string, unknown>): TicketDTO {
     statusLabel: String((doc.statusLabel as string) ?? status),
 
     processedBy: doc.processedBy ? String(doc.processedBy) : null,
-    processedByName: nameOf(doc.processedBy),
+    processedByName: doc.processedByName ? String(doc.processedByName) : nameOf(doc.processedBy),
     technician: doc.technician ? String(doc.technician) : null,
-    technicianName: doc.technician ? nameOf(doc.technician) : "Unassigned",
+    technicianName: doc.technician
+      ? String(doc.technicianName ?? "") || nameOf(doc.technician)
+      : String(doc.technicianName ?? "") || "Unassigned",
     closedBy: doc.closedBy ? String(doc.closedBy) : null,
-    closedByName: doc.closedBy ? nameOf(doc.closedBy) : "",
+    closedByName: doc.closedByName ? String(doc.closedByName) : nameOf(doc.closedBy),
     reopenedBy: doc.reopenedBy ? String(doc.reopenedBy) : null,
 
     scheduledDate: iso(doc.scheduledDate),

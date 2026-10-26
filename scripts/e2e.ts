@@ -1,4 +1,4 @@
-/**
+﻿/**
  * End-to-end API test against a running dev/prod server.
  *
  * Drives the real HTTP surface with a real session cookie: login, rate-limit,
@@ -14,15 +14,15 @@
 import "./load-env";
 
 import { createHmac } from "crypto";
-import { connectDB } from "../src/lib/db/mongoose";
-import { User, Role, RateLimit } from "../src/lib/models";
+import { connectDB } from "../src/lib/db/supabase";
+import { mapRoleRow, userFieldsToRow } from "../src/lib/db/mappers";
 import { hashPassword } from "../src/lib/auth/password";
 
 const BASE = (process.env.BASE_URL ?? "http://localhost:3000").replace(/\/$/, "");
 const SECRET = process.env.RESEND_INBOUND_SECRET ?? "test-webhook-secret";
 
 /**
- * A dedicated throwaway Super Admin.
+ * A dedicated throwaway SuperAdmin.
  *
  * The suite changes passwords and creates/deletes accounts, so it must never
  * run against the real seeded admin: a mid-run failure would otherwise leave the
@@ -34,32 +34,38 @@ const E2E_EMAIL = process.env.E2E_EMAIL ?? "e2e-runner@it-ticketing.local";
 const E2E_PASSWORD = "E2eRunner12345";
 
 async function provisionE2eAdmin(): Promise<void> {
-  await connectDB();
-  const superAdminRole = await Role.findOne({ name: "Super Admin" });
-  if (!superAdminRole) throw new Error("No Super Admin role. Run `npm run seed` first.");
+  const supabase = await connectDB();
+  const { data: roleRow } = await supabase
+    .from("roles")
+    .select("*")
+    .eq("name", "SuperAdmin")
+    .maybeSingle<Record<string, unknown>>();
+  if (!roleRow) throw new Error("No SuperAdmin role. Run `npm run seed` first.");
 
-  await User.deleteMany({ email: E2E_EMAIL });
+  await supabase.from("users").delete().eq("Email", E2E_EMAIL);
 
-  await User.create({
+  const row = userFieldsToRow({
     name: "E2E Runner",
     email: E2E_EMAIL,
     employeeId: "E2E-RUNNER",
     passwordHash: await hashPassword(E2E_PASSWORD),
     mustChangePassword: false,
-    role: superAdminRole._id,
+    roleId: mapRoleRow(roleRow).id,
     department: "Information Technology",
     status: "active",
   });
+  const { error } = await supabase.from("users").insert(row);
+  if (error) throw error;
 
   // Clear any limiter buckets so a previous aborted run cannot block sign-in.
-  await RateLimit.deleteMany({ key: { $regex: "^login:" } });
+  await supabase.from("rate_limits").delete().like("key", "login:%");
 }
 
 async function deprovisionE2eAdmin(): Promise<void> {
   try {
-    await connectDB();
-    await User.deleteMany({ email: E2E_EMAIL });
-    await RateLimit.deleteMany({ key: { $regex: "^login:" } });
+    const supabase = await connectDB();
+    await supabase.from("users").delete().eq("Email", E2E_EMAIL);
+    await supabase.from("rate_limits").delete().like("key", "login:%");
   } catch {
     // Best effort.
   }
@@ -146,7 +152,7 @@ function signedInbound(body: unknown) {
 async function main() {
   console.log(`E2E against ${BASE}\n`);
 
-  // A real Super Admin is needed for the RBAC assertions; create a disposable
+  // A real SuperAdmin is needed for the RBAC assertions; create a disposable
   // one so the suite never locks out the actual seeded account.
   await provisionE2eAdmin();
   const EMAIL = E2E_EMAIL;
@@ -476,7 +482,7 @@ async function main() {
   const allRoles = (await call("/api/roles")).body?.roles ?? [];
   const viewerRole = allRoles.find((r: any) => r.name === "Viewer");
   check("Viewer role exists", Boolean(viewerRole), allRoles.map((r: any) => r.name).join(", "));
-  check("seeded roles are all present", ["Super Admin", "Admin", "Agent", "Viewer"].every((name) => allRoles.some((r: any) => r.name === name)));
+  check("seeded roles are all present", ["SuperAdmin", "Admin", "Agent", "Viewer"].every((name) => allRoles.some((r: any) => r.name === name)));
   check("Viewer cannot create tickets", viewerRole?.permissions?.createTicket === false);
   check("Viewer cannot manage settings", viewerRole?.permissions?.manageSettings === false);
   check("Viewer can read tickets", viewerRole?.permissions?.viewAllTickets === true);
@@ -497,7 +503,7 @@ async function main() {
     method: "PATCH",
     json: { name: `E2E Temp Role ${Date.now()} Renamed`, description: "renamed" },
   });
-  check("Super Admin can rename a role", renamedRole.status === 200, String(renamedRole.status));
+  check("SuperAdmin can rename a role", renamedRole.status === 200, String(renamedRole.status));
 
   // Create a Viewer account and confirm it is walled off.
   const viewerAccount = await call("/api/users", {
@@ -550,7 +556,7 @@ async function main() {
     });
     check("viewer cannot edit dropdowns", viewerDropdownWrite.status === 403, String(viewerDropdownWrite.status));
 
-    // Clean up the probe account, then restore the Super Admin session.
+    // Clean up the probe account, then restore the SuperAdmin session.
     cookies.clear();
     for (const [key, value] of savedCookies) cookies.set(key, value);
     await call(`/api/users/${viewerAccount.body.user.id}`, { method: "DELETE" });
@@ -559,7 +565,7 @@ async function main() {
   // ── 9. Audit trail ──────────────────────────────────────────────────────
   section("9. Audit log");
   const audit = await call("/api/audit-logs?pageSize=100");
-  check("audit log readable by Super Admin", audit.status === 200);
+  check("audit log readable by SuperAdmin", audit.status === 200);
   const actions = (audit.body?.logs ?? []).map((log: any) => log.action);
   check("login was audited", actions.includes("user.login"), actions.slice(0, 5).join(","));
   check("ticket creation was audited", actions.includes("ticket.create"));
@@ -762,19 +768,19 @@ async function main() {
     check("unused custom role can be deleted", deleteRole.status === 200, String(deleteRole.status));
   }
 
-  const superAdmin = roles.find((r: any) => r.name === "Super Admin");
+  const superAdmin = roles.find((r: any) => r.name === "SuperAdmin");
   const lockout = await call(`/api/roles?id=${superAdmin?.id}`, {
     method: "PATCH",
     json: { permissions: { ...superAdmin?.permissions, manageRoles: false } },
   });
   check(
-    "Super Admin cannot strip its own role management",
+    "SuperAdmin cannot strip its own role management",
     lockout.status === 409,
     String(lockout.status),
   );
 
   const lastAdmin = (await call("/api/users?search=&status=active")).body?.users?.find(
-    (u: any) => u.roleName === "Super Admin" && u.email === EMAIL,
+    (u: any) => u.roleName === "SuperAdmin" && u.email === EMAIL,
   );
   if (lastAdmin) {
     const selfSuspend = await call(`/api/users/${lastAdmin.id}`, {

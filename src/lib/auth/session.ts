@@ -1,7 +1,7 @@
-import "server-only";
+﻿import "server-only";
 import { cookies } from "next/headers";
-import { connectDB } from "../db/mongoose";
-import { User, Role } from "../models";
+import { connectDB } from "../db/supabase";
+import { mapUserRow } from "../db/mappers";
 import { normalizePermissions, type PermissionKey, type PermissionSet } from "../shared/permissions";
 import { SESSION_COOKIE, sessionAgeSeconds, signSession, verifySession, type SessionClaims } from "./jwt";
 import { getSettings } from "../server/settings";
@@ -54,30 +54,42 @@ export async function getSessionUser(): Promise<AuthUser | null> {
   const age = sessionAgeSeconds(claims);
   if (age !== null && age > settings.sessionTimeoutMin * 60) return null;
 
-  const doc = await User.findById(claims.sub).lean<Record<string, unknown>>();
-  if (!doc) return null;
-  if (doc.status !== "active") return null;
+  const supabase = await connectDB();
 
-  const role = await Role.findById(doc.role as string).lean<{
-    name: string;
-    permissions: unknown;
-  }>();
+  // Always re-read the row rather than trusting the token body: a suspended
+  // account or a deleted role must take effect on the very next request.
+  const { data: row } = await supabase
+    .from("users")
+    .select("*")
+    .eq("id", Number(claims.sub))
+    .maybeSingle<Record<string, unknown>>();
+  if (!row) return null;
+
+  const doc = mapUserRow(row);
+  if (doc.status !== "active") return null;
+  if (!doc.roleId) return null;
+
+  const { data: role } = await supabase
+    .from("roles")
+    .select("name, permissions")
+    .eq("id", Number(doc.roleId))
+    .maybeSingle<{ name: string; permissions: unknown }>();
   if (!role) return null;
 
   return {
-    id: String(doc._id),
-    name: String(doc.name ?? ""),
-    email: String(doc.email ?? ""),
-    employeeId: String(doc.employeeId ?? ""),
-    roleId: String(doc.role),
+    id: doc.id,
+    name: doc.name,
+    email: doc.email,
+    employeeId: doc.employeeId,
+    roleId: doc.roleId,
     roleName: String(role.name ?? ""),
     permissions: normalizePermissions(role.permissions),
-    department: String(doc.department ?? ""),
-    site: String(doc.site ?? ""),
-    status: doc.status as "active" | "suspended",
-    avatarUrl: String(doc.avatarUrl ?? ""),
-    mustChangePassword: Boolean(doc.mustChangePassword),
-    lastLoginAt: (doc.lastLoginAt as Date | null) ?? null,
+    department: doc.department,
+    site: doc.site,
+    status: doc.status,
+    avatarUrl: doc.avatarUrl,
+    mustChangePassword: doc.mustChangePassword,
+    lastLoginAt: doc.lastLoginAt,
   };
 }
 
@@ -138,16 +150,13 @@ export async function createSessionCookie(
 /**
  * Agent scoping: viewers without `viewAllTickets` only ever see tickets assigned
  * to them or processed by them.
+ *
+ * Returns the PostgREST `.or()` scope string, or `null` when the user may see
+ * everything. `ticketQueryBuilder` applies the same rule for ticket lists.
  */
-export function canSeeAllTickets(user: AuthUser): boolean {
-  return user.permissions.viewAllTickets === true;
-}
-
-export function ticketVisibilityFilter(user: AuthUser): Record<string, unknown> {
-  if (canSeeAllTickets(user)) return {};
-  return {
-    $or: [{ technician: user.id }, { processedBy: user.id }],
-  };
+export function ticketVisibilityFilter(user: AuthUser): string | null {
+  if (user.permissions.viewAllTickets) return null;
+  return `technician_id.eq.${user.id},processed_by_id.eq.${user.id}`;
 }
 
 /** Whether the user may modify this specific ticket. */

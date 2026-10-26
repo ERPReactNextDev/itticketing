@@ -1,31 +1,40 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { getSettings } from "@/lib/server/settings";
 import { checkResendConnection, sendTestEmail } from "@/lib/server/resend";
-import { connectDB } from "@/lib/db/mongoose";
-import { EmailMessage } from "@/lib/models";
+import { connectDB } from "@/lib/db/supabase";
+import { mapEmailMessageRow } from "@/lib/db/mappers";
 import { withApi, readJson, ApiInputError } from "@/lib/server/http";
 
 export const dynamic = "force-dynamic";
 
 /** Resend connection status + last inbound processing snapshot. */
 export const GET = withApi(async () => {
-  await requireUser();
-  requirePermission(await requireUser(), "manageSettings");
+  const user = await requireUser();
+  requirePermission(user, "manageSettings");
 
   const settings = await getSettings();
   const connection = await checkResendConnection();
 
-  await connectDB();
-  const lastInbound = await EmailMessage.findOne({ direction: "in" })
-    .sort({ createdAt: -1 })
-    .select("messageId subject from ticket processedAt autoCreatedTicket")
-    .lean<Record<string, unknown>>();
+  const supabase = await connectDB();
+  const { data: inboundRow } = await supabase
+    .from("email_messages")
+    .select("*")
+    .eq("direction", "in")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<Record<string, unknown>>();
 
-  const lastOutbound = await EmailMessage.findOne({ direction: "out" })
-    .sort({ createdAt: -1 })
-    .select("messageId subject to sentAt")
-    .lean<Record<string, unknown>>();
+  const { data: outboundRow } = await supabase
+    .from("email_messages")
+    .select("*")
+    .eq("direction", "out")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<Record<string, unknown>>();
+
+  const lastInbound = inboundRow ? mapEmailMessageRow(inboundRow) : null;
+  const lastOutbound = outboundRow ? mapEmailMessageRow(outboundRow) : null;
 
   const webhookUrl = process.env.APP_URL
     ? `${process.env.APP_URL}/api/webhooks/resend/inbound`
@@ -44,20 +53,18 @@ export const GET = withApi(async () => {
     webhookUrl,
     lastInbound: lastInbound
       ? {
-          subject: String(lastInbound.subject ?? ""),
-          from: String(lastInbound.from ?? ""),
-          ticketId: lastInbound.ticket ? String(lastInbound.ticket) : null,
-          processedAt: lastInbound.processedAt
-            ? String(lastInbound.processedAt)
-            : String(lastInbound.createdAt ?? ""),
-          autoCreatedTicket: Boolean(lastInbound.autoCreatedTicket),
+          subject: lastInbound.subject,
+          from: lastInbound.from,
+          ticketId: lastInbound.ticketId,
+          processedAt: lastInbound.processedAt ?? lastInbound.createdAt,
+          autoCreatedTicket: lastInbound.autoCreatedTicket,
         }
       : null,
     lastOutbound: lastOutbound
       ? {
-          subject: String(lastOutbound.subject ?? ""),
-          to: ((lastOutbound.to ?? []) as unknown[]).map(String),
-          processedAt: String(lastOutbound.sentAt ?? lastOutbound.createdAt ?? ""),
+          subject: lastOutbound.subject,
+          to: lastOutbound.to,
+          processedAt: lastOutbound.processedAt ?? lastOutbound.createdAt,
         }
       : null,
   });

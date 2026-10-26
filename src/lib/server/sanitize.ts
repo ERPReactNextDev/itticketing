@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Minimal, dependency-free HTML sanitiser for inbound email bodies.
  *
  * Inbound mail is untrusted input that will later be rendered in the ticket

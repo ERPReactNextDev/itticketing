@@ -1,6 +1,18 @@
-import "server-only";
-import { connectDB } from "../db/mongoose";
-import { Ticket, Requestor, User, type TicketDoc } from "../models";
+﻿import "server-only";
+import { randomUUID } from "crypto";
+import { connectDB, unwrap, DatabaseError } from "../db/supabase";
+import {
+  asRecord,
+  asRecordArray,
+  asStringArray,
+  composeUserName,
+  mapRequestorRow,
+  mapTicketRow,
+  num,
+  slug,
+  str,
+  type TicketDocForDTO,
+} from "../db/mappers";
 import { DROPDOWN_TICKET_FIELD, type DropdownType } from "../shared/constants";
 import { getSettings } from "./settings";
 import {
@@ -13,6 +25,7 @@ import {
   resolveInitialStatus,
   resolvePriority,
   toActor,
+  type PriorityValue,
 } from "./actor";
 import type { AuthUser } from "../auth/session";
 
@@ -52,6 +65,205 @@ export class TicketValidationError extends Error {
   }
 }
 
+/** Anything that can identify a ticket: a DTO, a mapped row, a raw row. */
+export type PatchableTicket = {
+  id?: string | number;
+  _id?: string | number;
+  [key: string]: unknown;
+};
+
+/** Resolves the numeric primary key from any ticket-shaped object. */
+function ticketIdOf(ticket: PatchableTicket): number | null {
+  const raw = ticket.id ?? ticket._id;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toDate(value: unknown): Date | null {
+  if (value === null || value === undefined || value === "") return null;
+  const d = value instanceof Date ? value : new Date(String(value));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function isoOrNull(value: Date | null): string | null {
+  return value ? value.toISOString() : null;
+}
+
+/**
+ * Mutable view of the ticket fields this module writes.
+ *
+ * The helpers below talk in the app's camelCase names while the table is flat
+ * snake_case; `rowToMutable` / `mutableToRow` are the only places that know the
+ * difference. The index signature lets the dropdown-field loop index by name.
+ */
+type MutableTicket = {
+  id: number;
+  subject: string;
+  description: string;
+  department: string;
+  requestType: string;
+  typeOfConcern: string;
+  mode: string;
+  servicesGroup: string;
+  site: string;
+  status: string;
+  priority: PriorityValue;
+  [key: string]: unknown;
+  scheduledDate: Date | null;
+  requestor: string | null;
+  technician: string | null;
+  processedBy: string | null;
+  closedBy: string | null;
+  reopenedBy: string | null;
+  dateCreated: Date | null;
+  dateClosed: Date | null;
+  dateReopened: Date | null;
+  durationSeconds: number | null;
+  slaDueAt: Date | null;
+  slaPausedAt: Date | null;
+  slaPausedTotalSeconds: number;
+  attachments: string[];
+  requestorSnapshot: Record<string, string>;
+  lastActivityAt: Date | null;
+  remarks: Array<Record<string, unknown>>;
+  statusHistory: Array<Record<string, unknown>>;
+  assignmentHistory: Array<Record<string, unknown>>;
+};
+
+/** Supabase row -> the mutable camelCase working copy. */
+function rowToMutable(row: Record<string, unknown>): MutableTicket {
+  const snapshot = asRecord(row.requestor_snapshot);
+  const priorityData = asRecord(row.priority_data);
+  const priorityLabel = str(row.priority);
+  const priority: PriorityValue =
+    Object.keys(priorityData).length > 0
+      ? {
+          label: str(priorityData.label),
+          value: str(priorityData.value),
+          slaHours: num(priorityData.slaHours, 0),
+          color: priorityData.color ? str(priorityData.color) : "#ef4444",
+          inactive: priorityData.inactive === true,
+        }
+      : {
+          label: priorityLabel,
+          value: slug(priorityLabel),
+          slaHours: 0,
+          color: "#eab308",
+          inactive: true,
+        };
+
+  return {
+    id: Number(row.id),
+    subject: str(row.ticket_subject),
+    description: str(row.description),
+    department: str(row.department),
+    requestType: str(row.request_type),
+    typeOfConcern: str(row.type_concern),
+    mode: str(row.mode),
+    servicesGroup: str(row.group_services),
+    site: str(row.site),
+    status: str(row.status),
+    priority,
+    scheduledDate: toDate(row.date_scheduled),
+    requestor: row.requestor_id ? str(row.requestor_id) : null,
+    technician: row.technician_id ? str(row.technician_id) : null,
+    processedBy: row.processed_by_id ? str(row.processed_by_id) : null,
+    closedBy: row.closed_by_id ? str(row.closed_by_id) : null,
+    reopenedBy: row.reopened_by_id ? str(row.reopened_by_id) : null,
+    dateCreated: toDate(row.date_created),
+    dateClosed: toDate(row.date_closed),
+    dateReopened: toDate(row.date_reopened),
+    durationSeconds:
+      row.duration_seconds === null || row.duration_seconds === undefined
+        ? null
+        : num(row.duration_seconds, 0),
+    slaDueAt: toDate(row.sla_due_at),
+    slaPausedAt: toDate(row.sla_paused_at),
+    slaPausedTotalSeconds: num(row.sla_paused_total_seconds, 0),
+    attachments: asStringArray(row.attachments),
+    requestorSnapshot: {
+      employeeId: str(snapshot.employeeId),
+      fullName: str(snapshot.fullName),
+      email: str(snapshot.email),
+      department: str(snapshot.department),
+      site: str(snapshot.site),
+      phone: str(snapshot.phone),
+    },
+    lastActivityAt: toDate(row.last_activity_at),
+    remarks: asRecordArray(row.remarks_json),
+    statusHistory: asRecordArray(row.status_history),
+    assignmentHistory: asRecordArray(row.assignment_history),
+  };
+}
+
+/** The writable columns, serialised back to snake_case for an UPDATE. */
+function mutableToRow(doc: MutableTicket): Record<string, unknown> {
+  return {
+    ticket_subject: doc.subject,
+    description: doc.description,
+    department: doc.department,
+    request_type: doc.requestType,
+    type_concern: doc.typeOfConcern,
+    mode: doc.mode,
+    group_services: doc.servicesGroup,
+    site: doc.site,
+    status: doc.status,
+    // The legacy label column is kept in sync with the structured value.
+    priority: doc.priority.label,
+    priority_data: doc.priority,
+    requestor_id: doc.requestor,
+    requestor_snapshot: doc.requestorSnapshot,
+    requestor_name: doc.requestorSnapshot.fullName ?? "",
+    technician_id: doc.technician,
+    closed_by_id: doc.closedBy,
+    reopened_by_id: doc.reopenedBy,
+    date_closed: isoOrNull(doc.dateClosed),
+    date_reopened: isoOrNull(doc.dateReopened),
+    duration_seconds: doc.durationSeconds,
+    sla_due_at: isoOrNull(doc.slaDueAt),
+    sla_paused_at: isoOrNull(doc.slaPausedAt),
+    sla_paused_total_seconds: doc.slaPausedTotalSeconds,
+    date_scheduled: isoOrNull(doc.scheduledDate),
+    attachments: doc.attachments,
+    remarks_json: doc.remarks,
+    status_history: doc.statusHistory,
+    assignment_history: doc.assignmentHistory,
+    last_activity_at: isoOrNull(doc.lastActivityAt) ?? new Date().toISOString(),
+    date_updated: new Date().toISOString(),
+  };
+}
+
+/** Builds a timeline remark with a stable id and creation timestamp. */
+function buildRemark(
+  remark: {
+    type: string;
+    content: string;
+    authorName: string;
+    authorRef?: string | null;
+    field?: string;
+    oldValue?: string;
+    newValue?: string;
+    attachments?: string[];
+    emailMessageId?: string;
+  },
+  at: Date,
+): Record<string, unknown> {
+  return {
+    id: randomUUID(),
+    type: remark.type,
+    authorName: remark.authorName,
+    authorRef: remark.authorRef ?? null,
+    content: remark.content,
+    field: remark.field ?? "",
+    oldValue: remark.oldValue ?? "",
+    newValue: remark.newValue ?? "",
+    attachments: remark.attachments ?? [],
+    ...(remark.emailMessageId ? { emailMessageId: remark.emailMessageId } : {}),
+    createdAt: at.toISOString(),
+  };
+}
+
 /**
  * Creates a ticket with every derived field populated:
  * processedBy, technician, priority label + SLA, status, requestor snapshot,
@@ -60,8 +272,8 @@ export class TicketValidationError extends Error {
 export async function createTicket(
   input: CreateTicketInput,
   actor: AuthUser | null,
-): Promise<TicketDoc> {
-  await connectDB();
+): Promise<TicketDocForDTO> {
+  const supabase = await connectDB();
   const settings = await getSettings();
   const now = new Date();
 
@@ -75,22 +287,30 @@ export async function createTicket(
   let requestorSnapshot = buildRequestorSnapshot(null);
   let requestorId: string | null = null;
   if (input.requestorId) {
-    const requestor = await Requestor.findById(input.requestorId).lean<Record<string, unknown>>();
-    if (!requestor) {
+    const numeric = Number(input.requestorId);
+    const { data: requestorRow } = Number.isFinite(numeric)
+      ? await supabase
+          .from("requestors")
+          .select("*")
+          .eq("id", numeric)
+          .maybeSingle<Record<string, unknown>>()
+      : { data: null };
+    if (!requestorRow) {
       throw new TicketValidationError("That requestor no longer exists.", "requestorId");
     }
-    requestorId = String(requestor._id);
+    const requestor = mapRequestorRow(requestorRow);
+    requestorId = requestor.id;
     requestorSnapshot = buildRequestorSnapshot({
-      employeeId: (requestor.employeeId as string) ?? "",
-      fullName: (requestor.fullName as string) ?? "",
-      email: (requestor.email as string) ?? "",
-      department: (requestor.department as string) ?? "",
-      site: (requestor.site as string) ?? "",
-      phone: (requestor.phone as string) ?? "",
+      employeeId: requestor.employeeId,
+      fullName: requestor.fullName,
+      email: requestor.email,
+      department: requestor.department,
+      site: requestor.site,
+      phone: requestor.phone,
     });
     // Inherit requestor attributes the submitter left blank.
-    input.department ||= (requestor.department as string) ?? "";
-    input.site ||= (requestor.site as string) ?? "";
+    input.department ||= requestor.department;
+    input.site ||= requestor.site;
   }
 
   const priority = await resolvePriority(input.priority, settings.slaDefaults);
@@ -106,88 +326,120 @@ export async function createTicket(
   const technicianId =
     input.technicianId !== undefined
       ? input.technicianId
-      : ((await resolveDefaultTechnician(actor, assignmentMode)) as string | null);
+      : await resolveDefaultTechnician(actor, assignmentMode);
 
   const author = toActor(actor);
   const closed = isClosedStatus(status);
 
-  const ticket = new Ticket({
-    ticketNumber: input.ticketNumber,
-    patternVersion: input.patternVersion,
-    subject,
+  const remarks: Array<Record<string, unknown>> = [];
+  const note = (input.remarks ?? "").trim();
+  if (note) {
+    remarks.push(
+      buildRemark(
+        {
+          type: "note",
+          authorName: author.name,
+          authorRef: author.id,
+          content: note,
+        },
+        now,
+      ),
+    );
+  }
+  remarks.push(
+    buildRemark(
+      {
+        type: "system",
+        authorName: "System",
+        authorRef: null,
+        content: `Ticket created by ${author.name}`,
+      },
+      now,
+    ),
+  );
+  if (technicianId) {
+    remarks.push(
+      buildRemark(
+        {
+          type: "assignment",
+          authorName: author.name,
+          authorRef: author.id,
+          content: `Assigned to technician`,
+          field: "technician",
+          oldValue: "",
+          newValue: String(technicianId),
+        },
+        now,
+      ),
+    );
+  }
+
+  const row = {
+    ticket_id: input.ticketNumber,
+    pattern_version: input.patternVersion,
+    ticket_subject: subject,
     description: (input.description ?? "").trim(),
 
-    requestor: requestorId,
-    requestorSnapshot,
+    requestor_id: requestorId,
+    requestor_snapshot: requestorSnapshot,
+    requestor_name: requestorSnapshot.fullName,
 
     department: (input.department ?? "").trim(),
-    requestType: (input.requestType ?? "").trim(),
-    typeOfConcern: (input.typeOfConcern ?? "").trim(),
+    request_type: (input.requestType ?? "").trim(),
+    type_concern: (input.typeOfConcern ?? "").trim(),
     mode,
-    servicesGroup,
+    group_services: servicesGroup,
     site: (input.site ?? "").trim(),
 
-    priority,
+    priority: priority.label,
+    priority_data: priority,
     status,
 
-    processedBy: author.id,
-    technician: technicianId,
-    closedBy: closed ? author.id : null,
+    processed_by: author.name,
+    processed_by_id: author.id,
+    technician_id: technicianId,
+    technician_name: "",
+    closed_by: closed ? author.name : "",
+    closed_by_id: closed ? author.id : null,
 
-    scheduledDate: input.scheduledDate ?? null,
-    dateCreated: now,
-    dateClosed: closed ? now : null,
+    date_scheduled: input.scheduledDate ? input.scheduledDate.toISOString() : null,
+    date_created: now.toISOString(),
+    date_updated: now.toISOString(),
+    date_closed: closed ? now.toISOString() : null,
 
-    slaDueAt: computeDueAt(priority.slaHours, now),
-    slaPausedTotalSeconds: 0,
+    sla_due_at: computeDueAt(priority.slaHours, now).toISOString(),
+    sla_paused_total_seconds: 0,
     // Pause immediately if the ticket is created straight into Scheduled.
-    slaPausedAt: isPausedStatus(status) ? now : null,
+    sla_paused_at: isPausedStatus(status) ? now.toISOString() : null,
 
     attachments: input.attachments ?? [],
     source: input.source ?? "manual",
-    emailThreadId: input.emailThreadId,
-    emailMessageIds: input.emailMessageIds ?? [],
+    email_thread_id: input.emailThreadId ?? null,
+    email_message_ids: input.emailMessageIds ?? [],
 
-    lastActivityAt: now,
+    last_activity_at: now.toISOString(),
 
-    remarks: [],
-    statusHistory: [{ status, by: author.id, byName: author.name, at: now }],
-    assignmentHistory: technicianId
-      ? [{ technician: technicianId, by: author.id, byName: author.name, at: now }]
+    remarks_json: remarks,
+    status_history: [
+      { status, by: author.id, byName: author.name, at: now.toISOString() },
+    ],
+    assignment_history: technicianId
+      ? [
+          {
+            technician: technicianId,
+            technicianName: "",
+            by: author.id,
+            byName: author.name,
+            at: now.toISOString(),
+          },
+        ]
       : [],
-  });
+  };
 
-  const note = (input.remarks ?? "").trim();
-  if (note) {
-    ticket.remarks.push({
-      type: "note",
-      authorName: author.name,
-      authorRef: author.id,
-      content: note,
-    } as never);
-  }
-
-  ticket.remarks.push({
-    type: "system",
-    authorName: "System",
-    authorRef: null,
-    content: `Ticket created by ${author.name}`,
-  } as never);
-
-  if (technicianId) {
-    ticket.remarks.push({
-      type: "assignment",
-      authorName: author.name,
-      authorRef: author.id,
-      content: `Assigned to technician`,
-      field: "technician",
-      oldValue: "",
-      newValue: String(technicianId),
-    } as never);
-  }
-
-  await ticket.save();
-  return ticket;
+  const data = unwrap(
+    await supabase.from("tickets").insert(row).select("*").single<Record<string, unknown>>(),
+  );
+  return mapTicketRow(data);
 }
 
 /** Editable dropdown-backed fields that generate `field-change` remarks. */
@@ -204,48 +456,6 @@ export const EDITABLE_DROPDOWN_FIELDS = {
 
 type EditableDropdownType = keyof typeof EDITABLE_DROPDOWN_FIELDS;
 
-/**
- * Mutable view of the ticket fields this module writes.
- *
- * Mongoose's inferred document type is intentionally strict about assignment
- * (ObjectId vs string, required subdoc fields, no dynamic keys). This alias
- * describes exactly the fields `patchTicket` touches so the mutations stay
- * type-checked without scattering casts through the function.
- */
-type MutableTicket = {
-  subject: string;
-  description: string;
-  department: string;
-  requestType: string;
-  typeOfConcern: string;
-  mode: string;
-  servicesGroup: string;
-  site: string;
-  status: string;
-  priority: { label: string; value: string; slaHours: number; color: string; inactive?: boolean };
-  /** Allows the dropdown-field loop to index by field name. */
-  [key: string]: unknown;
-  scheduledDate: Date | null;
-  requestor: unknown;
-  technician: unknown;
-  processedBy: unknown;
-  closedBy: unknown;
-  reopenedBy: unknown;
-  dateCreated: Date;
-  dateClosed: Date | null;
-  dateReopened: Date | null;
-  durationSeconds: number | null;
-  slaDueAt: Date | null;
-  slaPausedAt: Date | null;
-  slaPausedTotalSeconds: number;
-  attachments: unknown[];
-  requestorSnapshot: Record<string, string>;
-  lastActivityAt: Date;
-  remarks: Array<Record<string, unknown>>;
-  statusHistory: Array<Record<string, unknown>>;
-  assignmentHistory: Array<Record<string, unknown>>;
-};
-
 export type TicketPatch = Partial<Record<string, unknown>>;
 
 export type PatchOptions = {
@@ -259,30 +469,50 @@ export type PatchOptions = {
  * Applies a partial update and, for every field that actually changed, appends
  * the matching timeline remark. This is the only sanctioned way to mutate a
  * ticket, which is what keeps the timeline complete.
+ *
+ * The row is re-read and written back in one round trip rather than issuing a
+ * separate UPDATE per column: the ticket is loaded, mutated, and persisted once.
  */
 export async function patchTicket(
-  ticket: TicketDoc,
+  ticket: PatchableTicket,
   patch: TicketPatch,
   actor: AuthUser | null,
   options: PatchOptions,
-): Promise<TicketDoc> {
-  await connectDB();
+): Promise<TicketDocForDTO> {
+  const supabase = await connectDB();
   const settings = await getSettings();
   const author = toActor(actor);
   const now = new Date();
-  const doc = ticket as unknown as MutableTicket;
+
+  const id = ticketIdOf(ticket);
+  if (id === null) throw new TicketValidationError("Ticket not found.", "id");
 
   const rejected = Object.keys(patch).filter((key) => !options.allowed.has(key));
   if (rejected.length > 0) {
-    throw new TicketValidationError(
-      `You cannot change: ${rejected.join(", ")}.`,
-      rejected[0],
-    );
+    throw new TicketValidationError(`You cannot change: ${rejected.join(", ")}.`, rejected[0]);
   }
+
+  const { data: currentRow } = await supabase
+    .from("tickets")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle<Record<string, unknown>>();
+  if (!currentRow) throw new TicketValidationError("Ticket not found.", "id");
+
+  const doc = rowToMutable(currentRow);
 
   const pushRemark = (remark: Record<string, unknown>) => {
     if (options.silent) return;
-    doc.remarks.push({ ...remark, authorName: author.name, authorRef: author.id });
+    doc.remarks.push(
+      buildRemark(
+        {
+          ...(remark as { type: string; content: string }),
+          authorName: author.name,
+          authorRef: author.id,
+        },
+        now,
+      ),
+    );
   };
 
   const fieldLabel = (key: string): string => {
@@ -306,12 +536,12 @@ export async function patchTicket(
   for (const key of ["subject", "description"] as const) {
     if (patch[key] === undefined) continue;
     const nextValue = String(patch[key] ?? "").trim();
-    const previousValue = String(ticket[key] ?? "").trim();
+    const previousValue = String(doc[key] ?? "").trim();
     if (nextValue === previousValue) continue;
     if (key === "subject" && !nextValue) {
       throw new TicketValidationError("Subject cannot be empty.", "subject");
     }
-    ticket[key] = nextValue as never;
+    doc[key] = nextValue;
     pushRemark({
       type: "field-change",
       content: `${fieldLabel(key)} changed`,
@@ -352,8 +582,8 @@ export async function patchTicket(
         status: nextValue,
         by: author.id,
         byName: author.name,
-        at: now,
-      } as never);
+        at: now.toISOString(),
+      });
 
       const nowClosed = isClosedStatus(nextValue);
       const wasClosed = isClosedStatus(previousStatus);
@@ -362,7 +592,7 @@ export async function patchTicket(
         doc.closedBy = author.id;
         doc.dateClosed = now;
         doc.durationSeconds = doc.dateCreated
-          ? Math.floor((now.getTime() - new Date(doc.dateCreated).getTime()) / 1000)
+          ? Math.floor((now.getTime() - doc.dateCreated.getTime()) / 1000)
           : null;
         pushRemark({
           type: "status-change",
@@ -404,9 +634,7 @@ export async function patchTicket(
           content: "SLA clock paused while ticket is Scheduled",
         });
       } else if (!shouldPause && doc.slaPausedAt) {
-        const pausedSeconds = Math.floor(
-          (now.getTime() - new Date(doc.slaPausedAt as Date).getTime()) / 1000,
-        );
+        const pausedSeconds = Math.floor((now.getTime() - doc.slaPausedAt.getTime()) / 1000);
         doc.slaPausedTotalSeconds = Number(doc.slaPausedTotalSeconds ?? 0) + pausedSeconds;
         doc.slaPausedAt = null;
         pushRemark({
@@ -430,7 +658,7 @@ export async function patchTicket(
   // ── Scheduled date ───────────────────────────────────────────────────────
   if (patch.scheduledDate !== undefined) {
     const nextValue = patch.scheduledDate ? new Date(patch.scheduledDate as string) : null;
-    const currentIso = doc.scheduledDate ? new Date(doc.scheduledDate).toISOString() : "";
+    const currentIso = doc.scheduledDate ? doc.scheduledDate.toISOString() : "";
     const nextIso = nextValue && !Number.isNaN(nextValue.getTime()) ? nextValue.toISOString() : "";
     if (nextIso !== currentIso) {
       doc.scheduledDate = nextIso ? nextValue : null;
@@ -449,25 +677,34 @@ export async function patchTicket(
     const nextId = patch.requestorId ? String(patch.requestorId) : "";
     const currentId = doc.requestor ? String(doc.requestor) : "";
     if (nextId !== currentId) {
-      const requestor = nextId
-        ? await Requestor.findById(nextId).lean<Record<string, unknown>>()
-        : null;
-      if (nextId && !requestor) {
-        throw new TicketValidationError("That requestor no longer exists.", "requestorId");
+      let requestor: ReturnType<typeof mapRequestorRow> | null = null;
+      if (nextId) {
+        const numeric = Number(nextId);
+        const { data: requestorRow } = Number.isFinite(numeric)
+          ? await supabase
+              .from("requestors")
+              .select("*")
+              .eq("id", numeric)
+              .maybeSingle<Record<string, unknown>>()
+          : { data: null };
+        if (!requestorRow) {
+          throw new TicketValidationError("That requestor no longer exists.", "requestorId");
+        }
+        requestor = mapRequestorRow(requestorRow);
       }
       const previousName = doc.requestorSnapshot?.fullName ?? "";
-      const nextName = (requestor?.fullName as string) ?? "";
+      const nextName = requestor?.fullName ?? "";
 
       doc.requestor = nextId || null;
       doc.requestorSnapshot = buildRequestorSnapshot(
         requestor
           ? {
-              employeeId: (requestor.employeeId as string) ?? "",
-              fullName: (requestor.fullName as string) ?? "",
-              email: (requestor.email as string) ?? "",
-              department: (requestor.department as string) ?? "",
-              site: (requestor.site as string) ?? "",
-              phone: (requestor.phone as string) ?? "",
+              employeeId: requestor.employeeId,
+              fullName: requestor.fullName,
+              email: requestor.email,
+              department: requestor.department,
+              site: requestor.site,
+              phone: requestor.phone,
             }
           : null,
       );
@@ -488,15 +725,29 @@ export async function patchTicket(
     if ((nextId ?? "") !== (currentId ?? "")) {
       let nextName = "Unassigned";
       if (nextId) {
-        const tech = await User.findById(nextId).select("name").lean<{ name?: string }>();
+        const numeric = Number(nextId);
+        const { data: tech } = Number.isFinite(numeric)
+          ? await supabase
+              .from("users")
+              .select("id, Firstname, Lastname")
+              .eq("id", numeric)
+              .maybeSingle<Record<string, unknown>>()
+          : { data: null };
         if (!tech) throw new TicketValidationError("That technician no longer exists.", "technician");
-        nextName = tech.name ?? String(nextId);
+        nextName = composeUserName(tech) || String(nextId);
       }
 
       let previousName = "Unassigned";
       if (currentId) {
-        const previous = await User.findById(currentId).select("name").lean<{ name?: string }>();
-        previousName = previous?.name ?? String(currentId);
+        const numeric = Number(currentId);
+        const { data: previous } = Number.isFinite(numeric)
+          ? await supabase
+              .from("users")
+              .select("id, Firstname, Lastname")
+              .eq("id", numeric)
+              .maybeSingle<Record<string, unknown>>()
+          : { data: null };
+        previousName = previous ? composeUserName(previous) || String(currentId) : String(currentId);
       }
 
       doc.technician = nextId;
@@ -505,8 +756,8 @@ export async function patchTicket(
         technicianName: nextName,
         by: author.id,
         byName: author.name,
-        at: now,
-      } as never);
+        at: now.toISOString(),
+      });
       pushRemark({
         type: "assignment",
         content: `Reassigned: ${previousName} → ${nextName}`,
@@ -520,10 +771,10 @@ export async function patchTicket(
   // ── Attachments ──────────────────────────────────────────────────────────
   if (patch.attachments !== undefined) {
     const next = Array.isArray(patch.attachments) ? (patch.attachments as string[]) : [];
-    const current = ((doc.attachments ?? []) as unknown[]).map(String);
-    const added = next.filter((id) => !current.includes(id));
+    const current = (doc.attachments ?? []).map(String);
+    const added = next.filter((fileId) => !current.includes(fileId));
     if (added.length > 0 || next.length !== current.length) {
-      doc.attachments = next as never;
+      doc.attachments = next;
       pushRemark({
         type: "field-change",
         content: `${added.length} attachment(s) added`,
@@ -535,13 +786,26 @@ export async function patchTicket(
   }
 
   doc.lastActivityAt = now;
-  await ticket.save();
-  return ticket;
+
+  const updated = unwrap(
+    await supabase
+      .from("tickets")
+      .update(mutableToRow(doc))
+      .eq("id", id)
+      .select("*")
+      .single<Record<string, unknown>>(),
+  );
+  return mapTicketRow(updated);
 }
 
-/** Appends a single remark. Used by notes, email in/out and system events. */
+/**
+ * Appends a single remark. Used by notes, email in/out and system events.
+ *
+ * The append happens inside `append_ticket_remark()` so two concurrent events
+ * cannot overwrite each other's remark (a read-modify-write in JS could).
+ */
 export async function appendRemark(
-  ticket: { _id: unknown },
+  ticket: PatchableTicket,
   remark: {
     type: string;
     content: string;
@@ -554,26 +818,13 @@ export async function appendRemark(
     emailMessageId?: string;
   },
 ): Promise<void> {
-  await connectDB();
-  await Ticket.updateOne(
-    { _id: ticket._id },
-    {
-      $push: {
-        remarks: {
-          type: remark.type,
-          authorName: remark.authorName,
-          authorRef: remark.authorRef ?? null,
-          content: remark.content,
-          field: remark.field ?? "",
-          oldValue: remark.oldValue ?? "",
-          newValue: remark.newValue ?? "",
-          attachments: remark.attachments ?? [],
-          emailMessageId: remark.emailMessageId,
-        },
-      } as never,
-      $set: { lastActivityAt: new Date() },
-    },
-  );
-}
+  const id = ticketIdOf(ticket);
+  if (id === null) return;
 
-export { Requestor };
+  const supabase = await connectDB();
+  const { error } = await supabase.rpc("append_ticket_remark", {
+    p_ticket_id: id,
+    p_remark: buildRemark(remark, new Date()),
+  });
+  if (error) throw new DatabaseError(error);
+}

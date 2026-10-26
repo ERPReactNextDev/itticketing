@@ -1,6 +1,6 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { User, Role } from "@/lib/models";
+﻿import { NextResponse } from "next/server";
+import { connectDB } from "@/lib/db/supabase";
+import { mapRoleRow, mapUserRow } from "@/lib/db/mappers";
 import { verifyPassword } from "@/lib/auth/password";
 import { createSessionCookie } from "@/lib/auth/session";
 import { getSettings } from "@/lib/server/settings";
@@ -33,12 +33,18 @@ export const POST = withApi(async (req: Request) => {
   const limited = await enforce(await loginRule(req, email));
   if (limited) return limited;
 
-  await connectDB();
+  const supabase = await connectDB();
   const settings = await getSettings();
 
-  // `passwordHash` is `select: false` on the schema, so ask for it explicitly.
-  const user = await User.findOne({ email }).select("+passwordHash");
-  if (!user) {
+  // Emails are stored lower-cased (schema.sql normalises any legacy casing),
+  // so a single equality lookup is enough - and it uses the unique index.
+  const { data: row } = await supabase
+    .from("users")
+    .select("*")
+    .eq("Email", email)
+    .maybeSingle<Record<string, unknown>>();
+
+  if (!row) {
     await writeAuditLog({
       action: "user.login.failed",
       entity: "User",
@@ -50,17 +56,20 @@ export const POST = withApi(async (req: Request) => {
     return NextResponse.json({ error: "invalid_credentials", message: GENERIC_ERROR }, { status: 401 });
   }
 
+  const doc = mapUserRow(row, true);
+  const userId = Number(doc.id);
+
   // Account lockout is checked before the password compare so a locked account
   // cannot be used as a password oracle.
-  if (user.lockUntil && user.lockUntil.getTime() > Date.now()) {
-    const minutes = Math.max(1, Math.ceil((user.lockUntil.getTime() - Date.now()) / 60000));
+  if (doc.lockUntil && doc.lockUntil.getTime() > Date.now()) {
+    const minutes = Math.max(1, Math.ceil((doc.lockUntil.getTime() - Date.now()) / 60000));
     await writeAuditLog({
-      actorId: String(user._id),
-      actorName: user.name,
-      actorEmail: user.email,
+      actorId: doc.id,
+      actorName: doc.name,
+      actorEmail: doc.email,
       action: "user.login.blocked",
       entity: "User",
-      entityId: String(user._id),
+      entityId: doc.id,
       ip: clientIp(req),
       userAgent: userAgent(req),
       meta: { reason: "locked", minutesRemaining: minutes },
@@ -74,7 +83,7 @@ export const POST = withApi(async (req: Request) => {
     );
   }
 
-  if (user.status !== "active") {
+  if (doc.status !== "active") {
     return NextResponse.json(
       {
         error: "account_suspended",
@@ -84,32 +93,30 @@ export const POST = withApi(async (req: Request) => {
     );
   }
 
-  const passwordOk = await verifyPassword(password, user.passwordHash);
+  const passwordOk = await verifyPassword(password, doc.passwordHash);
 
   if (!passwordOk) {
-    const failedAttempts = Number(user.failedLoginAttempts ?? 0) + 1;
+    const failedAttempts = doc.failedLoginAttempts + 1;
     const shouldLock = failedAttempts >= settings.rateLimits.loginLockAfterFails;
 
-    await User.updateOne(
-      { _id: user._id },
-      {
-        $set: {
-          failedLoginAttempts: failedAttempts,
-          // Lock window matches the login limiter window so both reset together.
-          lockUntil: shouldLock
-            ? new Date(Date.now() + settings.rateLimits.loginWindowMin * 60_000)
-            : null,
-        },
-      },
-    );
+    await supabase
+      .from("users")
+      .update({
+        LoginAttempts: failedAttempts,
+        // Lock window matches the login limiter window so both reset together.
+        lock_until: shouldLock
+          ? new Date(Date.now() + settings.rateLimits.loginWindowMin * 60_000).toISOString()
+          : null,
+      })
+      .eq("id", userId);
 
     await writeAuditLog({
-      actorId: String(user._id),
-      actorName: user.name,
-      actorEmail: user.email,
+      actorId: doc.id,
+      actorName: doc.name,
+      actorEmail: doc.email,
       action: "user.login.failed",
       entity: "User",
-      entityId: String(user._id),
+      entityId: doc.id,
       ip: clientIp(req),
       userAgent: userAgent(req),
       meta: { failedAttempts, locked: shouldLock },
@@ -131,38 +138,42 @@ export const POST = withApi(async (req: Request) => {
     );
   }
 
-  const role = await Role.findById(user.role);
-  if (!role) {
+  const { data: roleRow } = await supabase
+    .from("roles")
+    .select("*")
+    .eq("id", Number(doc.roleId))
+    .maybeSingle<Record<string, unknown>>();
+
+  if (!roleRow) {
     return NextResponse.json(
       { error: "server_error", message: "Your account has no role assigned. Contact an administrator." },
       { status: 500 },
     );
   }
+  const role = mapRoleRow(roleRow);
 
-  await User.updateOne(
-    { _id: user._id },
-    { $set: { failedLoginAttempts: 0, lockUntil: null, lastLoginAt: new Date() } },
-  );
+  await supabase
+    .from("users")
+    .update({
+      LoginAttempts: 0,
+      lock_until: null,
+      LastLoginAt: new Date().toISOString().slice(0, 10),
+    })
+    .eq("id", userId);
 
   const token = await createSessionCookie(
-    {
-      id: String(user._id),
-      email: user.email,
-      name: user.name,
-      roleId: String(role._id),
-      roleName: role.name,
-    },
+    { id: doc.id, email: doc.email, name: doc.name, roleId: role.id, roleName: role.name },
     settings.sessionTimeoutMin,
   );
   await setSessionCookie(token);
 
   await writeAuditLog({
-    actorId: String(user._id),
-    actorName: user.name,
-    actorEmail: user.email,
+    actorId: doc.id,
+    actorName: doc.name,
+    actorEmail: doc.email,
     action: "user.login",
     entity: "User",
-    entityId: String(user._id),
+    entityId: doc.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
   });
@@ -173,19 +184,19 @@ export const POST = withApi(async (req: Request) => {
 
   return NextResponse.json({
     user: {
-      id: String(user._id),
-      name: user.name,
-      email: user.email,
-      employeeId: user.employeeId ?? "",
-      roleId: String(role._id),
+      id: doc.id,
+      name: doc.name,
+      email: doc.email,
+      employeeId: doc.employeeId,
+      roleId: role.id,
       roleName: role.name,
       permissions: normalizePermissions(role.permissions),
-      department: user.department ?? "",
-      site: user.site ?? "",
-      status: user.status,
-      avatarUrl: user.avatarUrl ?? "",
-      mustChangePassword: Boolean(user.mustChangePassword),
-      lastLoginAt: user.lastLoginAt ?? null,
+      department: doc.department,
+      site: doc.site,
+      status: doc.status,
+      avatarUrl: doc.avatarUrl,
+      mustChangePassword: doc.mustChangePassword,
+      lastLoginAt: doc.lastLoginAt,
     },
   });
 });

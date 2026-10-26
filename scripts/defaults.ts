@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Canonical seed values for every configurable dropdown (§5 of the spec).
  *
  * Kept in a standalone module (not inside a Mongoose model) so both the seed
@@ -107,9 +107,9 @@ export const SEED_DROPDOWNS: SeedDropdown[] = [
   },
 ];
 
-/** Default Super Admin login created by the seed. */
+/** Default SuperAdmin login created by the seed. */
 export const SEED_SUPER_ADMIN = {
-  name: "Super Admin",
+  name: "SuperAdmin",
   email: process.env.SEED_ADMIN_EMAIL || "admin@it-ticketing.local",
   /**
    * Must satisfy `validatePasswordStrength` (10+ chars, a letter and a digit) -

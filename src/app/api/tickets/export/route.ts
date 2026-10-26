@@ -1,8 +1,7 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import { requireUser, requirePermission } from "@/lib/auth/session";
-import { connectDB } from "@/lib/db/mongoose";
-import { Ticket } from "@/lib/models";
-import { buildTicketFilter, buildTicketSort } from "@/lib/server/ticket-query";
+import { buildNameMap, ticketQueryBuilder } from "@/lib/server/ticket-query";
+import { mapTicketRow } from "@/lib/db/mappers";
 import { toTicketRowDTO } from "@/lib/server/serialize";
 import { toCsv } from "@/lib/shared/csv";
 import { csvParam } from "@/lib/server/http";
@@ -20,7 +19,6 @@ export const dynamic = "force-dynamic";
 export const GET = withApiExport(async (req: Request) => {
   const user = await requireUser();
   requirePermission(user, "exportCsv");
-  await connectDB();
 
   const url = new URL(req.url);
   const query: TicketListQuery = {
@@ -36,23 +34,24 @@ export const GET = withApiExport(async (req: Request) => {
     breachedOnly: url.searchParams.get("breachedOnly") === "true",
     sort: "newest",
     page: 1,
-    // A generous ceiling keeps a single request from pulling the whole database.
+    // A generous ceiling keeps a single request from pulling the whole table.
     pageSize: 10_000,
   };
 
-  const filter = buildTicketFilter(query, user);
-  const docs = await Ticket.find(filter)
-    .sort(buildTicketSort(query.sort))
-    .limit(10_000)
-    .populate([
-      { path: "processedBy", select: "name" },
-      { path: "technician", select: "name" },
-      { path: "closedBy", select: "name" },
-    ])
-    .lean<Record<string, unknown>[]>();
+  const builder = ticketQueryBuilder(query, user, { count: false });
+  const { data } = await builder.limit(10_000);
+  const rows = (data ?? []) as unknown as Array<Record<string, unknown>>;
 
-  const rows = docs.map((doc) => {
-    const dto = toTicketRowDTO(doc);
+  const names = await buildNameMap(
+    rows.flatMap((row) => [
+      row.processed_by_id ? String(row.processed_by_id) : null,
+      row.technician_id ? String(row.technician_id) : null,
+      row.closed_by_id ? String(row.closed_by_id) : null,
+    ]),
+  );
+
+  const exportRows = rows.map((row) => {
+    const dto = toTicketRowDTO(mapTicketRow(row, names));
     return {
       ticketNumber: dto.ticketNumber,
       subject: dto.subject,
@@ -91,7 +90,7 @@ export const GET = withApiExport(async (req: Request) => {
     "scheduledDate", "durationSeconds", "slaRemainingSeconds", "slaBreached", "isClosed",
   ];
 
-  const csv = toCsv(headers, rows);
+  const csv = toCsv(headers, exportRows);
 
   return new NextResponse(csv, {
     headers: {

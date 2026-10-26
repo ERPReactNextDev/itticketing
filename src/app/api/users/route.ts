@@ -1,6 +1,6 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { User, Role } from "@/lib/models";
+﻿import { NextResponse } from "next/server";
+import { connectDB, DatabaseError } from "@/lib/db/supabase";
+import { mapUserRow, userFieldsToRow, type UserDoc } from "@/lib/db/mappers";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { hashPassword, validatePasswordStrength } from "@/lib/auth/password";
 import { writeAuditLog } from "@/lib/server/audit";
@@ -9,12 +9,7 @@ import { withApi, readJson, intParam, csvParam, ApiInputError } from "@/lib/serv
 
 export const dynamic = "force-dynamic";
 
-type Lean = Record<string, unknown>;
-
-/** Guards against a Mongoose CastError on a malformed id. */
-function isObjectId(value: string): boolean {
-  return /^[0-9a-fA-F]{24}$/.test(value);
-}
+type Row = Record<string, unknown>;
 
 export type UserDTO = {
   id: string;
@@ -35,70 +30,98 @@ export type UserDTO = {
   createdAt: string;
 };
 
-function toDTO(doc: Lean, roleName: string): UserDTO {
-  const lockUntil = doc.lockUntil ? new Date(doc.lockUntil as string) : null;
+function toDTO(doc: UserDoc, roleName: string): UserDTO {
   return {
-    id: String(doc._id),
-    name: String(doc.name ?? ""),
-    email: String(doc.email ?? ""),
-    employeeId: String(doc.employeeId ?? ""),
-    roleId: String(doc.role ?? ""),
+    id: doc.id,
+    name: doc.name,
+    email: doc.email,
+    employeeId: doc.employeeId,
+    roleId: doc.roleId,
     roleName,
-    department: String(doc.department ?? ""),
-    site: String(doc.site ?? ""),
-    position: String(doc.position ?? ""),
-    phone: String(doc.phone ?? ""),
-    status: String(doc.status ?? "active"),
-    avatarUrl: String(doc.avatarUrl ?? ""),
-    lastLoginAt: doc.lastLoginAt ? String(doc.lastLoginAt) : null,
-    mustChangePassword: Boolean(doc.mustChangePassword),
-    locked: Boolean(lockUntil && lockUntil.getTime() > Date.now()),
-    createdAt: String(doc.createdAt ?? ""),
+    department: doc.department,
+    site: doc.site,
+    position: doc.position,
+    phone: doc.phone,
+    status: doc.status,
+    avatarUrl: doc.avatarUrl,
+    lastLoginAt: doc.lastLoginAt ? doc.lastLoginAt.toISOString() : null,
+    mustChangePassword: doc.mustChangePassword,
+    locked: Boolean(doc.lockUntil && doc.lockUntil.getTime() > Date.now()),
+    createdAt: doc.createdAt ?? "",
   };
+}
+
+/**
+ * PostgREST's `or` filter is comma/paren delimited and `%` is a LIKE wildcard,
+ * so a raw search term could be read as filter syntax. Strip those characters
+ * before interpolating.
+ */
+function sanitizeTerm(value: string): string {
+  return value.replace(/[(),%]/g, " ").trim();
 }
 
 export const GET = withApi(async (req: Request) => {
   const user = await requireUser();
-  await connectDB();
+  const supabase = await connectDB();
 
   const url = new URL(req.url);
   const search = (url.searchParams.get("search") ?? "").trim();
   const statuses = csvParam(url.searchParams.get("status"));
   const roleIds = csvParam(url.searchParams.get("roleId"));
 
-  const filter: Record<string, unknown> = {};
-  if (search) {
-    const safe = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const rx = new RegExp(safe, "i");
-    filter.$or = [{ name: rx }, { email: rx }, { employeeId: rx }];
-  }
-  if (statuses.length) filter.status = { $in: statuses };
-  if (roleIds.length) filter.role = { $in: roleIds };
-
   const page = intParam(url.searchParams.get("page"), 1, { min: 1 });
   const pageSize = intParam(url.searchParams.get("pageSize"), 25, { min: 1, max: 200 });
 
-  // Viewer / Agent roles do not get the full staff list - only Super Admin and
+  let q = supabase.from("users").select("*", { count: "exact" });
+
+  if (search) {
+    const term = sanitizeTerm(search);
+    if (term) {
+      q = q.or(
+        [
+          `Firstname.ilike.%${term}%`,
+          `Lastname.ilike.%${term}%`,
+          `Email.ilike.%${term}%`,
+          `ReferenceID.ilike.%${term}%`,
+        ].join(","),
+      );
+    }
+  }
+
+  if (statuses.length) {
+    // The legacy `Status` column is free text ("Active", "Suspended", ...), so
+    // match case-insensitively rather than on an exact value.
+    const clauses = statuses.map((s) => sanitizeTerm(s)).filter(Boolean);
+    if (clauses.length) q = q.or(clauses.map((s) => `Status.ilike.${s}`).join(","));
+  }
+
+  const numericRoleIds = roleIds.map(Number).filter(Number.isFinite);
+  if (numericRoleIds.length) q = q.in("role_id", numericRoleIds);
+
+  // Viewer / Agent roles do not get the full staff list - only SuperAdmin and
   // Admin can browse the directory. Agents see only themselves.
-  const canBrowse = user.permissions.manageUsers;
-  if (!canBrowse) filter._id = user.id;
+  if (!user.permissions.manageUsers) q = q.eq("id", Number(user.id));
 
-  const [rows, total] = await Promise.all([
-    User.find(filter)
-      .sort({ name: 1 })
-      .skip((page - 1) * pageSize)
-      .limit(pageSize)
-      .lean<Lean[]>(),
-    User.countDocuments(filter),
-  ]);
+  const { data, error, count } = await q
+    .order("Firstname", { ascending: true })
+    .order("Lastname", { ascending: true })
+    .range((page - 1) * pageSize, page * pageSize - 1);
+  if (error) throw new DatabaseError(error);
 
-  const roles = await Role.find().lean<Array<{ _id: unknown; name: string }>>();
-  const roleNameById = new Map(roles.map((role) => [String(role._id), role.name]));
+  const rows = (data ?? []) as unknown as Row[];
+  const total = count ?? 0;
+
+  const { data: roleRows, error: roleError } = await supabase.from("roles").select("id, name");
+  if (roleError) throw new DatabaseError(roleError);
+  const roleNameById = new Map(
+    (roleRows ?? []).map((role) => [String(role.id), String(role.name ?? "")]),
+  );
 
   return NextResponse.json({
-    users: rows.map((doc) =>
-      toDTO(doc, roleNameById.get(String(doc.role ?? "")) ?? "Unassigned"),
-    ),
+    users: rows.map((row) => {
+      const doc = mapUserRow(row);
+      return toDTO(doc, roleNameById.get(doc.roleId) ?? "Unassigned");
+    }),
     total,
     page,
     pageSize,
@@ -125,7 +148,7 @@ export const POST = withApi(async (req: Request) => {
   requirePermission(user, "manageUsers");
 
   const body = await readJson<CreateBody>(req);
-  await connectDB();
+  const supabase = await connectDB();
 
   const name = (body.name ?? "").trim();
   const email = (body.email ?? "").trim().toLowerCase();
@@ -136,12 +159,24 @@ export const POST = withApi(async (req: Request) => {
     throw new ApiInputError("That email address is not valid.");
   }
   if (!body.roleId) throw new ApiInputError("A role must be assigned.");
-  if (!isObjectId(body.roleId)) throw new ApiInputError("That role id is not valid.");
 
-  const role = await Role.findById(body.roleId);
+  const roleId = Number(body.roleId);
+  if (!Number.isFinite(roleId)) throw new ApiInputError("That role id is not valid.");
+
+  const { data: role, error: roleError } = await supabase
+    .from("roles")
+    .select("id, name")
+    .eq("id", roleId)
+    .maybeSingle<{ id: unknown; name: string }>();
+  if (roleError) throw new DatabaseError(roleError);
   if (!role) throw new ApiInputError("That role does not exist.");
 
-  const existing = await User.findOne({ email });
+  const { data: existing, error: existingError } = await supabase
+    .from("users")
+    .select("id")
+    .eq("Email", email)
+    .maybeSingle<{ id: unknown }>();
+  if (existingError) throw new DatabaseError(existingError);
   if (existing) {
     return NextResponse.json(
       { error: "duplicate", message: "A user with that email already exists." },
@@ -157,19 +192,32 @@ export const POST = withApi(async (req: Request) => {
     return NextResponse.json({ error: "weak_password", message: strength.message }, { status: 400 });
   }
 
-  const doc = await User.create({
-    name,
-    email,
-    employeeId: (body.employeeId ?? "").trim(),
-    passwordHash: await hashPassword(password),
-    mustChangePassword: true,
-    role: role._id,
-    department: (body.department ?? "").trim(),
-    site: (body.site ?? "").trim(),
-    position: (body.position ?? "").trim(),
-    phone: (body.phone ?? "").trim(),
-    status: body.status === "suspended" ? "suspended" : "active",
-  });
+  // `ReferenceID` is NOT NULL + UNIQUE on the legacy table, so blank employee
+  // ids would collide. Fall back to the already-unique email.
+  const employeeId = (body.employeeId ?? "").trim() || email;
+
+  const { data: created, error: insertError } = await supabase
+    .from("users")
+    .insert(
+      userFieldsToRow({
+        name,
+        email,
+        employeeId,
+        passwordHash: await hashPassword(password),
+        mustChangePassword: true,
+        roleId: String(roleId),
+        department: (body.department ?? "").trim(),
+        site: (body.site ?? "").trim(),
+        position: (body.position ?? "").trim(),
+        phone: (body.phone ?? "").trim(),
+        status: body.status === "suspended" ? "suspended" : "active",
+      }),
+    )
+    .select("*")
+    .single<Row>();
+  if (insertError) throw new DatabaseError(insertError);
+
+  const doc = mapUserRow(created);
 
   await writeAuditLog({
     actorId: user.id,
@@ -177,18 +225,14 @@ export const POST = withApi(async (req: Request) => {
     actorEmail: user.email,
     action: "user.create",
     entity: "User",
-    entityId: String(doc._id),
+    entityId: doc.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
-    meta: { email, roleId: String(role._id) },
+    meta: { email, roleId: String(roleId) },
   });
 
-  const created = await User.findById(doc._id).lean<Lean>();
-  if (!created) {
-    return NextResponse.json({ error: "not_found", message: "Account created but could not be read back." }, { status: 500 });
-  }
   return NextResponse.json(
-    { user: toDTO(created, role.name), temporaryPassword: body.password ? undefined : password },
+    { user: toDTO(doc, role.name), temporaryPassword: body.password ? undefined : password },
     { status: 201 },
   );
 });

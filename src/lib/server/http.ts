@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { AuthError, ForbiddenError } from "../auth/session";
+import { DatabaseError, UNIQUE_VIOLATION } from "../db/supabase";
 
 /**
  * A caller mistake with a specific status: malformed JSON, a missing field, a
@@ -56,31 +57,20 @@ export function handleApiError(error: unknown): NextResponse {
     );
   }
 
-  // Mongoose validation errors are the caller's fault, not a server fault.
-  const maybeValidation = error as {
-    name?: string;
-    errors?: Record<string, { message?: string }>;
-  };
-  if (maybeValidation?.name === "ValidationError" && maybeValidation.errors) {
+  // A Postgres/PostgREST failure. A unique-constraint violation is the caller's
+  // fault (a duplicate email, employee id, ...) and maps to a 409; anything else
+  // is a genuine server fault and is logged with its full detail.
+  if (error instanceof DatabaseError) {
+    if (error.code === UNIQUE_VIOLATION) {
+      return NextResponse.json(
+        { error: "duplicate", message: "That value is already in use." },
+        { status: 409 },
+      );
+    }
+    console.error("[db] unhandled error:", error);
     return NextResponse.json(
-      {
-        error: "validation_error",
-        message: "Some fields are invalid.",
-        fields: Object.fromEntries(
-          Object.entries(maybeValidation.errors).map(([key, detail]) => [
-            key,
-            detail?.message ?? "Invalid value",
-          ]),
-        ),
-      },
-      { status: 400 },
-    );
-  }
-
-  if ((error as { code?: number })?.code === 11000) {
-    return NextResponse.json(
-      { error: "duplicate", message: "That value is already in use." },
-      { status: 409 },
+      { error: "server_error", message: "Something went wrong. Please try again." },
+      { status: 500 },
     );
   }
 

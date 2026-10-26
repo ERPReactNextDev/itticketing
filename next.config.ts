@@ -1,9 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Mongoose / the MongoDB driver must stay outside the bundler so the
-  // connection pool survives across route handler invocations.
-  serverExternalPackages: ["mongoose", "mongodb", "bcrypt"],
+  // bcrypt ships a native binding, so it must stay outside the bundler rather
+  // than be traced into the server bundle.
+  serverExternalPackages: ["bcrypt"],
   experimental: {
     // CSV payloads for the requestor importer can get large.
     serverActions: { bodySizeLimit: "8mb" },

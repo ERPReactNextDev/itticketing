@@ -1,11 +1,13 @@
 import "server-only";
-import { connectDB } from "../db/mongoose";
-import { TicketCounter, GLOBAL_COUNTER_KEY } from "../models/ticket-counter";
+import { connectDB } from "../db/supabase";
 import { getSettings } from "./settings";
 import { appDateKey, appParts } from "../shared/time";
 import type { SettingsShape } from "./settings";
 
 export const DEFAULT_PAD = 3;
+
+/** Reserved counter key used when sequences must not reset daily. */
+export const GLOBAL_COUNTER_KEY = "GLOBAL";
 
 /**
  * Expands a ticket-number pattern into a concrete number.
@@ -87,6 +89,152 @@ export function hasSequenceToken(pattern: string): boolean {
   return /\{SEQ(?::\d+)?\}/i.test(pattern ?? "");
 }
 
+/** The numbering rule used when Settings has none stored. */
+const DEFAULT_PATTERN = "{PREFIX}-{YYYY}-{MM}-{DD}-{SEQ:3}";
+
+/**
+ * Builds a LIKE filter and a regex that together isolate the `{SEQ}` digits of
+ * the ticket numbers belonging to the current counter bucket.
+ *
+ * `tickets` predates the counter, so the highest number already in the table has
+ * to be discovered from the numbers themselves (the same token-to-pattern trick
+ * `extractTicketNumber` uses for email subjects). In a per-day bucket the date
+ * tokens pin the match to today; in the shared bucket the sequence runs across
+ * every date, so those tokens become wildcards.
+ */
+function seqMatchers(cfg: SettingsShape): { like: string; regex: RegExp } | null {
+  const pattern = cfg.ticketNumberPattern || DEFAULT_PATTERN;
+  if (!hasSequenceToken(pattern)) return null;
+
+  const parts = appParts();
+  const escapeLike = (value: string) => value.replace(/[\\%_]/g, (m) => `\\${m}`);
+  const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  let like = "";
+  let source = "";
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  const tokenRe = /\{(PREFIX|YYYY|YY|MM|DD|SEQ)(?::(\d+))?\}/gi;
+  while ((match = tokenRe.exec(pattern)) !== null) {
+    const literal = pattern.slice(cursor, match.index);
+    like += escapeLike(literal);
+    source += escapeRegex(literal);
+    cursor = match.index + match[0].length;
+
+    switch (match[1].toUpperCase()) {
+      case "PREFIX":
+        like += escapeLike(cfg.ticketPrefix);
+        source += escapeRegex(cfg.ticketPrefix);
+        break;
+      case "YYYY":
+        like += cfg.resetSeqPerDay ? String(parts.year) : "%";
+        source += "[0-9]{4}";
+        break;
+      case "YY":
+        like += cfg.resetSeqPerDay ? parts.year2 : "%";
+        source += "[0-9]{2}";
+        break;
+      case "MM":
+        like += cfg.resetSeqPerDay ? parts.month : "%";
+        source += "[0-9]{2}";
+        break;
+      case "DD":
+        like += cfg.resetSeqPerDay ? parts.day : "%";
+        source += "[0-9]{2}";
+        break;
+      case "SEQ":
+        like += "%";
+        // Captured, because the sequence is the value the counter has to clear.
+        source += "([0-9]+)";
+        break;
+    }
+  }
+
+  const tail = pattern.slice(cursor);
+  like += escapeLike(tail);
+  source += escapeRegex(tail);
+
+  return { like, regex: new RegExp(`^${source}$`) };
+}
+
+/**
+ * Highest sequence already stored in `tickets` for the current bucket, or 0 when
+ * nothing matches yet.
+ *
+ * This is what lets numbering start above the legacy rows: the counter table was
+ * introduced with this migration, so on a database that already holds tickets it
+ * begins at zero and would hand out numbers the `tickets_ticket_id_key` unique
+ * index has already seen.
+ */
+async function highestIssuedSequence(cfg: SettingsShape): Promise<number> {
+  const matchers = seqMatchers(cfg);
+  if (!matchers) return 0;
+
+  try {
+    const supabase = await connectDB();
+    // Descending order means the row cap cannot hide the answer: with a
+    // fixed-width sequence the largest value also sorts first.
+    const { data, error } = await supabase
+      .from("tickets")
+      .select("ticket_id")
+      .like("ticket_id", matchers.like)
+      .order("ticket_id", { ascending: false })
+      .limit(1000);
+    if (error) throw error;
+
+    let highest = 0;
+    for (const row of data ?? []) {
+      const match = matchers.regex.exec(String((row as Record<string, unknown>).ticket_id ?? ""));
+      const seq = match ? Number(match[1]) : NaN;
+      if (Number.isFinite(seq) && seq > highest) highest = seq;
+    }
+    return highest;
+  } catch (error) {
+    // Best-effort repair: never block ticket creation on this lookup. If the
+    // read fails here the insert it guards would fail too, so the caller still
+    // gets a clear error rather than a silent duplicate.
+    console.error("[ticket-number] could not read the highest issued number:", error);
+    return 0;
+  }
+}
+
+/**
+ * Lifts the counter to `floor` when it is behind it.
+ *
+ * The update is guarded by `seq < floor`, which makes it atomic: a reservation
+ * that has already advanced the counter past `floor` is never dragged backwards,
+ * so a stale read is harmless.
+ */
+async function reconcileCounter(dateKey: string, floor: number): Promise<void> {
+  if (floor <= 0) return;
+
+  try {
+    const supabase = await connectDB();
+    const { data, error } = await supabase
+      .from("ticket_counters")
+      .update({ seq: floor, updated_at: new Date().toISOString() })
+      .eq("date_key", dateKey)
+      .lt("seq", floor)
+      .select("date_key");
+    if (error) throw error;
+    if (data && data.length > 0) return;
+
+    // `ignoreDuplicates` covers the remaining cases in one safe step: the bucket
+    // has no row yet (created at the floor) or the counter is already at or
+    // above it (left untouched).
+    const { error: upsertError } = await supabase
+      .from("ticket_counters")
+      .upsert(
+        { date_key: dateKey, seq: floor, updated_at: new Date().toISOString() },
+        { onConflict: "date_key", ignoreDuplicates: true },
+      );
+    if (upsertError) throw upsertError;
+  } catch (error) {
+    console.error("[ticket-number] could not reconcile the counter:", error);
+  }
+}
+
 /**
  * Extracts a ticket number out of an email subject.
  *
@@ -137,10 +285,15 @@ export function extractTicketNumber(subject: string, settings: SettingsShape): s
 /**
  * Atomically reserves the next sequence number.
  *
- * `$inc` with `upsert` is the only safe way to do this: two parallel requests
- * both read-then-write would collide and hand out the same number. The unique
- * index on `dateKey` means a true race surfaces as a duplicate-key error, which
- * is retried against the now-existing document.
+ * The increment happens inside the `next_ticket_seq()` SQL function
+ * (`insert ... on conflict (date_key) do update set seq = seq + 1 returning`),
+ * which is the only safe way to do this: two parallel requests that read then
+ * wrote would collide and hand out the same number.
+ *
+ * Before reserving, the counter is lifted to the highest number already in
+ * `tickets` for this bucket. Numbering must therefore know which ids are taken,
+ * otherwise a database that received tickets before the counter existed would
+ * be handed a number the `tickets_ticket_id_key` unique index already holds.
  */
 export async function nextSequence(settings?: SettingsShape): Promise<{
   seq: number;
@@ -150,27 +303,14 @@ export async function nextSequence(settings?: SettingsShape): Promise<{
   const cfg = settings ?? (await getSettings());
   const dateKey = cfg.resetSeqPerDay ? appDateKey() : GLOBAL_COUNTER_KEY;
 
-  await connectDB();
+  const highest = await highestIssuedSequence(cfg);
+  await reconcileCounter(dateKey, highest);
 
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      const doc = await TicketCounter.findOneAndUpdate(
-        { dateKey },
-        { $inc: { seq: 1 }, $setOnInsert: { dateKey } },
-        { upsert: true, new: true, setDefaultsOnInsert: true },
-      ).lean<{ seq: number }>();
+  const supabase = await connectDB();
+  const { data, error } = await supabase.rpc("next_ticket_seq", { p_date_key: dateKey });
+  if (error) throw error;
 
-      const seq = doc?.seq ?? 1;
-      return { seq, dateKey, patternVersion: cfg.patternVersion };
-    } catch (error) {
-      // 11000 = another request inserted the same dateKey first. Re-run the
-      // update, which is now a plain $inc against the existing document.
-      if ((error as { code?: number })?.code === 11000) continue;
-      throw error;
-    }
-  }
-
-  throw new Error("Could not reserve a ticket sequence number.");
+  return { seq: Number(data ?? 1), dateKey, patternVersion: cfg.patternVersion };
 }
 
 export type ReservedTicketNumber = {
@@ -217,12 +357,22 @@ export async function previewNextTicketNumber(): Promise<{
   const dateKey = cfg.resetSeqPerDay ? appDateKey() : GLOBAL_COUNTER_KEY;
   let currentSeq = 0;
   try {
-    await connectDB();
-    const doc = await TicketCounter.findOne({ dateKey }).lean<{ seq: number }>();
-    currentSeq = doc?.seq ?? 0;
+    const supabase = await connectDB();
+    const { data } = await supabase
+      .from("ticket_counters")
+      .select("seq")
+      .eq("date_key", dateKey)
+      .maybeSingle();
+    currentSeq = Number(data?.seq ?? 0);
   } catch {
     currentSeq = 0;
   }
+
+  // The counter alone can lag behind the numbers already issued, so the preview
+  // reports the same floor `nextSequence` would reconcile to. Otherwise the
+  // badge would promise a number the create call refuses to hand out.
+  const highest = await highestIssuedSequence(cfg);
+  if (highest > currentSeq) currentSeq = highest;
 
   return {
     current: renderTicketNumber(

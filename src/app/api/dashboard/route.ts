@@ -1,6 +1,6 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { Ticket, EmailMessage, User } from "@/lib/models";
+﻿import { NextResponse } from "next/server";
+import { connectDB, DatabaseError } from "@/lib/db/supabase";
+import { asRecord, composeUserName, num, str } from "@/lib/db/mappers";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { withApi } from "@/lib/server/http";
 import { computeSla, slaBand } from "@/lib/server/sla";
@@ -8,185 +8,110 @@ import { CLOSED_STATUS_VALUES } from "@/lib/shared/constants";
 
 export const dynamic = "force-dynamic";
 
+type Row = Record<string, unknown>;
+
+/** Columns the aggregates need. Deliberately narrow - no remarks, no snapshots. */
+const TICKET_COLUMNS = [
+  "id",
+  "ticket_id",
+  "ticket_subject",
+  "status",
+  "priority",
+  "priority_data",
+  "department",
+  "technician_id",
+  "technician_name",
+  "source",
+  "sla_due_at",
+  "sla_paused_total_seconds",
+  "sla_paused_at",
+  "date_created",
+  "duration_seconds",
+].join(", ");
+
 /**
  * Dashboard aggregates.
  *
- * Previously this page pulled the entire `tickets` collection into the browser
- * and derived every chart client-side. All aggregation now happens in Mongo, so
- * the payload stays small and the numbers are correct at scale.
+ * PostgREST has no `$group`, so the scoped tickets are read once with a narrow
+ * projection and every breakdown is derived in JS. That keeps the payload small
+ * (the numbers stay correct at scale) without a round trip per chart.
  */
 export const GET = withApi(async (req: Request) => {
   const user = await requireUser();
   requirePermission(user, "viewDashboard");
 
-  await connectDB();
+  const supabase = await connectDB();
   const url = new URL(req.url);
 
   const from = parseDate(url.searchParams.get("from"));
   const to = parseDate(url.searchParams.get("to"));
 
-  const baseFilter: Record<string, unknown> = {};
-  if (from || to) {
-    const range: Record<string, Date> = {};
-    if (from) range.$gte = from;
-    if (to) range.$lte = to;
-    baseFilter.dateCreated = range;
-  }
+  let query = supabase.from("tickets").select(TICKET_COLUMNS);
+  if (from) query = query.gte("date_created", from.toISOString());
+  if (to) query = query.lte("date_created", to.toISOString());
 
   // Respect the same visibility rule as the ticket list.
-  const scopeFilter: Record<string, unknown> = { ...baseFilter };
   if (!user.permissions.viewAllTickets) {
-    scopeFilter.$or = [{ technician: user.id }, { processedBy: user.id }];
+    query = query.or(`technician_id.eq.${user.id},processed_by_id.eq.${user.id}`);
   }
 
-  const [
-    totalTickets,
-    openTickets,
-    closedTickets,
-    fromGmail,
-    byStatus,
-    byPriority,
-    byTechnician,
-    byDepartment,
-    slaStats,
-    atRisk,
-    recentInbound,
-  ] = await Promise.all([
-    Ticket.countDocuments(scopeFilter),
-    Ticket.countDocuments({ ...scopeFilter, status: { $nin: CLOSED_STATUS_VALUES } }),
-    Ticket.countDocuments({ ...scopeFilter, status: { $in: CLOSED_STATUS_VALUES } }),
-    Ticket.countDocuments({ ...scopeFilter, source: "email" }),
+  const { data, error } = await query;
+  if (error) throw new DatabaseError(error);
 
-    Ticket.aggregate<{ _id: string; count: number }>([
-      { $match: scopeFilter },
-      { $group: { _id: "$status", count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]),
+  // The client is untyped, so PostgREST rows arrive with an opaque shape.
+  const rows = (data ?? []) as unknown as Row[];
+  const isClosed = (row: Row) => CLOSED_STATUS_VALUES.includes(str(row.status).toLowerCase());
 
-    Ticket.aggregate<{ _id: string; count: number }>([
-      { $match: scopeFilter },
-      { $group: { _id: "$priority.label", count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]),
+  const openRows = rows.filter((row) => !isClosed(row));
+  const closedRows = rows.filter(isClosed);
 
-    Ticket.aggregate<{ _id: unknown; name?: string; count: number }>([
-      { $match: scopeFilter },
-      { $group: { _id: "$technician", count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 10 },
-    ]),
+  const byStatusMap = new Map<string, number>();
+  const byPriorityMap = new Map<string, number>();
+  const byTechnicianMap = new Map<string, number>();
+  const byDepartmentMap = new Map<string, number>();
 
-    Ticket.aggregate<{ _id: string; count: number }>([
-      { $match: scopeFilter },
-      { $group: { _id: "$department", count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 12 },
-    ]),
+  for (const row of rows) {
+    bump(byStatusMap, str(row.status));
+    bump(byPriorityMap, str(asRecord(row.priority_data).label) || str(row.priority));
+    bump(byTechnicianMap, row.technician_id ? String(row.technician_id) : "");
+    bump(byDepartmentMap, str(row.department));
+  }
 
-    // SLA health over currently-open tickets.
-    Ticket.aggregate<{ breached: number; total: number; ratios: number[] }>([
-      {
-        $match: {
-          ...scopeFilter,
-          status: { $nin: CLOSED_STATUS_VALUES },
-          slaDueAt: { $ne: null },
-        },
-      },
-      {
-        $project: {
-          effectiveDue: {
-            $add: [
-              "$slaDueAt",
-              { $multiply: [{ $ifNull: ["$slaPausedTotalSeconds", 0] }, 1000] },
-            ],
-          },
-          slaHours: "$priority.slaHours",
-          dateCreated: 1,
-        },
-      },
-      {
-        $project: {
-          breached: { $lt: ["$effectiveDue", "$$NOW"] },
-          slaHours: 1,
-          dateCreated: 1,
-        },
-      },
-      {
-        $group: {
-          _id: null,
-          breached: { $sum: { $cond: ["$breached", 1, 0] } },
-          total: { $sum: 1 },
-        },
-      },
-    ]),
-
-    // The tickets closest to breaching, for the alerting banner.
-    Ticket.find({
-      ...scopeFilter,
-      status: { $nin: CLOSED_STATUS_VALUES },
-      slaDueAt: { $ne: null },
-    })
-      .sort({ slaDueAt: 1 })
-      .limit(5)
-      .select("ticketNumber subject priority status slaDueAt slaPausedTotalSeconds slaPausedAt dateCreated technician")
-      .populate("technician", "name")
-      .lean<Array<Record<string, unknown>>>(),
-
-    EmailMessage.countDocuments({
-      direction: "in",
-      processedAt: { $gte: new Date(Date.now() - 24 * 3600 * 1000) },
-      autoCreatedTicket: true,
-    }),
-  ]);
-
-  // Technician names need one extra lookup keyed by id.
-  const technicianIds = byTechnician.map((row) => (row._id ? String(row._id) : "")).filter(Boolean);
-  const technicians = await User.find({ _id: { $in: technicianIds } })
-    .select("name")
-    .lean<Array<{ _id: unknown; name?: string }>>();
-  const technicianNameById = new Map(technicians.map((t) => [String(t._id), t.name ?? ""]));
-
-  const slaRows = await Ticket.find({
-    ...scopeFilter,
-    status: { $nin: CLOSED_STATUS_VALUES },
-    slaDueAt: { $ne: null },
-  })
-    .select("slaDueAt slaPausedTotalSeconds slaPausedAt priority status dateCreated")
-    .lean<Array<Record<string, unknown>>>();
+  // SLA health + the tickets closest to breaching, over currently-open tickets.
+  const slaRows = openRows.filter((row) => row.sla_due_at !== null && row.sla_due_at !== undefined);
 
   let breached = 0;
   let warning = 0;
   for (const row of slaRows) {
-    const state = computeSla({
-      slaDueAt: row.slaDueAt as Date,
-      slaPausedTotalSeconds: Number(row.slaPausedTotalSeconds ?? 0),
-      slaPausedAt: row.slaPausedAt as Date,
-      priority: row.priority as { slaHours?: number },
-      status: String(row.status ?? ""),
-      dateCreated: row.dateCreated as Date,
-    });
+    const state = slaState(row);
     if (state.breached) breached += 1;
     else if (state.warning) warning += 1;
   }
 
-  const atRiskDtos = atRisk.map((row) => {
-    const state = computeSla({
-      slaDueAt: row.slaDueAt as Date,
-      slaPausedTotalSeconds: Number(row.slaPausedTotalSeconds ?? 0),
-      slaPausedAt: row.slaPausedAt as Date,
-      priority: row.priority as { slaHours?: number },
-      status: String(row.status ?? ""),
-      dateCreated: row.dateCreated as Date,
-    });
-    const technician = row.technician as { name?: string } | null;
+  const atRiskRows = [...slaRows]
+    .sort((a, b) => new Date(str(a.sla_due_at)).getTime() - new Date(str(b.sla_due_at)).getTime())
+    .slice(0, 5);
+
+  const topTechnicians = topEntries(byTechnicianMap, 10);
+  const technicianNameById = await resolveTechnicianNames([
+    ...topTechnicians.map(([id]) => id),
+    ...atRiskRows.map((row) => (row.technician_id ? String(row.technician_id) : "")),
+  ]);
+
+  const atRiskTickets = atRiskRows.map((row) => {
+    const state = slaState(row);
+    const priority = asRecord(row.priority_data);
     return {
-      id: String(row._id),
-      ticketNumber: String(row.ticketNumber),
-      subject: String(row.subject),
-      priorityLabel: String((row.priority as { label?: string })?.label ?? ""),
-      priorityColor: (row.priority as { color?: string })?.color ?? "#ef4444",
-      status: String(row.status),
-      technicianName: technician?.name ?? "Unassigned",
+      id: str(row.id),
+      ticketNumber: str(row.ticket_id),
+      subject: str(row.ticket_subject),
+      priorityLabel: str(priority.label),
+      priorityColor: str(priority.color) || "#ef4444",
+      status: str(row.status),
+      technicianName:
+        technicianNameById.get(row.technician_id ? String(row.technician_id) : "") ||
+        str(row.technician_name) ||
+        "Unassigned",
       remainingSeconds: state.remainingSeconds,
       breached: state.breached,
       band: slaBand(state),
@@ -194,44 +119,87 @@ export const GET = withApi(async (req: Request) => {
   });
 
   // Average resolution time over closed tickets in range.
-  const closedDurations = await Ticket.find({
-    ...scopeFilter,
-    status: { $in: CLOSED_STATUS_VALUES },
-    durationSeconds: { $ne: null },
-  })
-    .select("durationSeconds")
-    .lean<Array<{ durationSeconds?: number }>>();
-  const avgResolutionSeconds = closedDurations.length
-    ? Math.round(
-        closedDurations.reduce((sum, row) => sum + Number(row.durationSeconds ?? 0), 0) /
-          closedDurations.length,
-      )
+  const durations = closedRows
+    .map((row) => row.duration_seconds)
+    .filter((value) => value !== null && value !== undefined)
+    .map((value) => num(value, 0));
+  const avgResolutionSeconds = durations.length
+    ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length)
     : null;
+
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const { count: inboundLast24h } = await supabase
+    .from("email_messages")
+    .select("id", { count: "exact", head: true })
+    .eq("direction", "in")
+    .eq("auto_created_ticket", true)
+    .gte("processed_at", since);
 
   return NextResponse.json({
     totals: {
-      all: totalTickets,
-      open: openTickets,
-      closed: closedTickets,
-      fromGmail,
-      inboundLast24h: recentInbound,
+      all: rows.length,
+      open: openRows.length,
+      closed: closedRows.length,
+      fromGmail: rows.filter((row) => str(row.source) === "email").length,
+      inboundLast24h: inboundLast24h ?? 0,
       breached,
       atRisk: warning,
       avgResolutionSeconds,
     },
-    byStatus: byStatus.map((row) => ({ key: String(row._id), count: row.count })),
-    byPriority: byPriority.map((row) => ({ key: String(row._id), count: row.count })),
-    byTechnician: byTechnician.map((row) => ({
-      name: row._id ? (technicianNameById.get(String(row._id)) ?? "Unknown") : "Unassigned",
-      count: row.count,
+    byStatus: topEntries(byStatusMap, 0).map(([key, count]) => ({ key, count })),
+    byPriority: topEntries(byPriorityMap, 0).map(([key, count]) => ({ key, count })),
+    byTechnician: topTechnicians.map(([id, count]) => ({
+      name: id ? (technicianNameById.get(id) ?? "Unknown") : "Unassigned",
+      count,
     })),
-    byDepartment: byDepartment.map((row) => ({
-      key: String(row._id) || "Unassigned",
-      count: row.count,
+    byDepartment: topEntries(byDepartmentMap, 12).map(([key, count]) => ({
+      key: key || "Unassigned",
+      count,
     })),
-    atRiskTickets: atRiskDtos,
+    atRiskTickets,
   });
 });
+
+function bump(map: Map<string, number>, key: string): void {
+  map.set(key, (map.get(key) ?? 0) + 1);
+}
+
+/** Sorted `[key, count]` pairs, highest count first. `limit = 0` means no cap. */
+function topEntries(map: Map<string, number>, limit: number): Array<[string, number]> {
+  const entries = [...map.entries()].sort((a, b) => b[1] - a[1]);
+  return limit > 0 ? entries.slice(0, limit) : entries;
+}
+
+function slaState(row: Row) {
+  return computeSla({
+    slaDueAt: row.sla_due_at as string | null,
+    slaPausedTotalSeconds: num(row.sla_paused_total_seconds, 0),
+    slaPausedAt: row.sla_paused_at as string | null,
+    priority: { slaHours: num(asRecord(row.priority_data).slaHours, 0) },
+    status: str(row.status),
+    dateCreated: row.date_created as string | null,
+  });
+}
+
+/** Resolves technician ids to display names in one extra query. */
+async function resolveTechnicianNames(ids: string[]): Promise<Map<string, string>> {
+  const unique = Array.from(new Set(ids.filter(Boolean)))
+    .map(Number)
+    .filter(Number.isFinite);
+  const map = new Map<string, string>();
+  if (unique.length === 0) return map;
+
+  const supabase = await connectDB();
+  const { data } = await supabase
+    .from("users")
+    .select("id, Firstname, Lastname")
+    .in("id", unique);
+
+  for (const row of (data ?? []) as Row[]) {
+    map.set(String(row.id), composeUserName(row));
+  }
+  return map;
+}
 
 function parseDate(value: string | null): Date | null {
   if (!value) return null;

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Lists every account with its role, so you can see who to reset.
  *
  *   npm run list-accounts
@@ -6,34 +6,28 @@
 
 import "./load-env";
 
-import { connectDB } from "../src/lib/db/mongoose";
-import { User } from "../src/lib/models";
+import { connectDB } from "../src/lib/db/supabase";
+import { mapUserRow } from "../src/lib/db/mappers";
 
 async function main() {
-  await connectDB();
+  const supabase = await connectDB();
 
-  const accounts = await User.find()
-    .sort({ name: 1 })
-    .lean<
-      Array<{
-        name?: string;
-        email?: string;
-        status?: string;
-        mustChangePassword?: boolean;
-        failedLoginAttempts?: number;
-        lockUntil?: Date | string | null;
-        lastLoginAt?: Date | string | null;
-      }>
-    >();
+  const { data, error } = await supabase
+    .from("users")
+    .select("*")
+    .order("Firstname", { ascending: true });
+  if (error) throw error;
+
+  const accounts = (data ?? []).map((row) => mapUserRow(row as Record<string, unknown>));
 
   if (accounts.length === 0) {
-    console.log("No accounts. Run `npm run seed` to create the Super Admin.");
+    console.log("No accounts. Run `npm run seed` to create the SuperAdmin.");
     process.exit(0);
   }
 
-  const locked = (value: Date | string | null | undefined) => {
+  const locked = (value: Date | null) => {
     if (!value) return false;
-    return new Date(value).getTime() > Date.now();
+    return value.getTime() > Date.now();
   };
 
   console.log(`\n${accounts.length} account(s)\n`);
@@ -42,16 +36,16 @@ async function main() {
       account.status !== "active" ? account.status : "",
       account.mustChangePassword ? "must-change-password" : "",
       locked(account.lockUntil) ? "LOCKED" : "",
-      (account.failedLoginAttempts ?? 0) > 0 ? `${account.failedLoginAttempts} failed` : "",
+      account.failedLoginAttempts > 0 ? `${account.failedLoginAttempts} failed` : "",
     ]
       .filter(Boolean)
       .join(", ");
 
     console.log(`  ${account.email}`);
-    console.log(`    name:  ${account.name ?? "-"}`);
+    console.log(`    name:  ${account.name || "-"}`);
     console.log(`    state: ${flags || "ok"}`);
     if (account.lastLoginAt) {
-      console.log(`    last:  ${new Date(account.lastLoginAt).toISOString()}`);
+      console.log(`    last:  ${account.lastLoginAt.toISOString()}`);
     }
     console.log("");
   }

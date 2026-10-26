@@ -1,7 +1,6 @@
-import "server-only";
-import { connectDB } from "../db/mongoose";
-import { User, DropdownOption, Ticket } from "../models";
-import { buildFullName } from "../models/requestor";
+﻿import "server-only";
+import { connectDB } from "../db/supabase";
+import { buildFullName, normalizeUserStatus } from "../db/mappers";
 import type { AuthUser } from "../auth/session";
 import { CLOSED_STATUS_VALUES, PAUSED_STATUS_VALUES, type DropdownType } from "../shared/constants";
 import { getSettings } from "./settings";
@@ -13,6 +12,14 @@ export type PriorityValue = {
   slaHours: number;
   color: string;
   inactive?: boolean;
+};
+
+type DropdownRow = {
+  label: string;
+  value: string;
+  sla_hours: number | null;
+  color: string | null;
+  active: boolean;
 };
 
 /**
@@ -27,21 +34,21 @@ export async function resolveDropdownValue(
   value: string,
 ): Promise<{ label: string; value: string; slaHours?: number; color?: string; inactive: boolean } | null> {
   if (!value) return null;
-  await connectDB();
-  const doc = await DropdownOption.findOne({ type, value }).lean<{
-    label: string;
-    value: string;
-    slaHours?: number;
-    color?: string;
-    active: boolean;
-  }>();
-  if (!doc) return { label: value, value, inactive: true };
+  const supabase = await connectDB();
+  const { data } = await supabase
+    .from("dropdown_options")
+    .select("label, value, sla_hours, color, active")
+    .eq("type", type)
+    .eq("value", value)
+    .maybeSingle<DropdownRow>();
+
+  if (!data) return { label: value, value, inactive: true };
   return {
-    label: doc.label,
-    value: doc.value,
-    slaHours: doc.slaHours,
-    color: doc.color,
-    inactive: doc.active !== true,
+    label: data.label,
+    value: data.value,
+    slaHours: data.sla_hours ?? undefined,
+    color: data.color ?? undefined,
+    inactive: data.active !== true,
   };
 }
 
@@ -54,21 +61,21 @@ export async function resolvePriority(
   input: string | undefined | null,
   settingsSlaDefaults: Record<string, number>,
 ): Promise<PriorityValue> {
-  await connectDB();
+  const supabase = await connectDB();
 
   if (input) {
-    const option = await DropdownOption.findOne({ type: "priority", value: input }).lean<{
-      label: string;
-      value: string;
-      slaHours?: number;
-      color?: string;
-      active: boolean;
-    }>();
+    const { data: option } = await supabase
+      .from("dropdown_options")
+      .select("label, value, sla_hours, color, active")
+      .eq("type", "priority")
+      .eq("value", input)
+      .maybeSingle<DropdownRow>();
+
     if (option) {
       return {
         label: option.label,
         value: option.value,
-        slaHours: resolveSlaHours(option.value, option.slaHours, settingsSlaDefaults),
+        slaHours: resolveSlaHours(option.value, option.sla_hours ?? undefined, settingsSlaDefaults),
         color: option.color ?? "#ef4444",
         inactive: option.active !== true,
       };
@@ -83,15 +90,20 @@ export async function resolvePriority(
   }
 
   // No priority given: default to the lowest-SLA active option, else P-3.
-  const fallback = await DropdownOption.findOne({ type: "priority", active: true })
-    .sort({ slaHours: 1 })
-    .lean<{ label: string; value: string; slaHours?: number; color?: string }>();
+  const { data: fallback } = await supabase
+    .from("dropdown_options")
+    .select("label, value, sla_hours, color, active")
+    .eq("type", "priority")
+    .eq("active", true)
+    .order("sla_hours", { ascending: true, nullsFirst: false })
+    .limit(1)
+    .maybeSingle<DropdownRow>();
 
   if (fallback) {
     return {
       label: fallback.label,
       value: fallback.value,
-      slaHours: resolveSlaHours(fallback.value, fallback.slaHours, settingsSlaDefaults),
+      slaHours: resolveSlaHours(fallback.value, fallback.sla_hours ?? undefined, settingsSlaDefaults),
       color: fallback.color ?? "#eab308",
     };
   }
@@ -115,23 +127,33 @@ export async function resolveDropdownField(
   const raw = (input ?? "").trim();
   if (!raw) return "";
 
-  await connectDB();
-  const option = await DropdownOption.findOne({
-    type,
-    $or: [{ value: raw }, { label: raw }],
-  }).lean<{ value: string }>();
+  const supabase = await connectDB();
+  // Double-quoting makes PostgREST treat the value literally, so a label that
+  // contains a comma or parenthesis cannot break the filter expression.
+  const literal = raw.replace(/"/g, '\\"');
+  const { data } = await supabase
+    .from("dropdown_options")
+    .select("value")
+    .eq("type", type)
+    .or(`value.eq."${literal}",label.eq."${literal}"`)
+    .maybeSingle<{ value: string }>();
 
-  return option?.value ?? raw;
+  return data?.value ?? raw;
 }
 
 /** Default status for a new ticket: the first active status option. */
 export async function resolveInitialStatus(preferred?: string): Promise<string> {
   if (preferred) return preferred;
-  await connectDB();
-  const first = await DropdownOption.findOne({ type: "status", active: true })
-    .sort({ order: 1 })
-    .lean<{ value: string }>();
-  if (first) return first.value;
+  const supabase = await connectDB();
+  const { data } = await supabase
+    .from("dropdown_options")
+    .select("value")
+    .eq("type", "status")
+    .eq("active", true)
+    .order("sort_order", { ascending: true })
+    .limit(1)
+    .maybeSingle<{ value: string }>();
+  if (data) return data.value;
   return "pending";
 }
 
@@ -153,50 +175,60 @@ export function isPausedStatus(status: string | null | undefined): boolean {
 export async function resolveDefaultTechnician(
   creator: AuthUser | null,
   mode: "self" | "round-robin" | "unassigned",
-): Promise<ObjectIdLike | null> {
+): Promise<string | null> {
   if (mode === "unassigned") return null;
-  if (mode === "self") return creator ? (creator.id as ObjectIdLike) : null;
+  if (mode === "self") return creator ? creator.id : null;
 
-  await connectDB();
-  const agents = await User.find({
-    status: "active",
-    role: { $in: await roleIdsWithPermission("assignTechnician") },
-  })
-    .select("_id")
-    .lean<{ _id: ObjectIdLike }[]>();
+  const supabase = await connectDB();
+  const roleIds = await roleIdsWithPermission("assignTechnician");
+  if (roleIds.length === 0) return null;
+
+  // The legacy `Status` column is free-form, so the active check happens in JS
+  // via the same normaliser the rest of the app uses, rather than a brittle
+  // case-sensitive SQL equality.
+  const { data } = await supabase
+    .from("users")
+    .select("id, Status")
+    .in("role_id", roleIds.map(Number));
+
+  const agents = (data ?? [])
+    .filter((row) => normalizeUserStatus(row.Status) === "active")
+    .map((row) => String(row.id))
+    .sort();
 
   if (agents.length === 0) return null;
 
-  // Count open tickets per agent and give the next one to the lightest load.
-  const counts = await Ticket.aggregate<{ _id: ObjectIdLike; count: number }>([
-    { $match: { technician: { $in: agents.map((a) => a._id) }, status: { $nin: CLOSED_STATUS_VALUES } } },
-    { $group: { _id: "$technician", count: { $sum: 1 } } },
-  ]);
+  // Open-ticket load per technician, counted in one aggregate query.
+  const { data: counts } = await supabase.rpc("ticket_counts_by_technician");
+  const load = new Map<string, number>(
+    ((counts ?? []) as Array<{ technician_id: string; open_count: number }>).map((row) => [
+      String(row.technician_id),
+      Number(row.open_count ?? 0),
+    ]),
+  );
 
-  const load = new Map(counts.map((c) => [String(c._id), c.count]));
   let best = agents[0];
-  let bestLoad = load.get(String(best._id)) ?? 0;
+  let bestLoad = load.get(best) ?? 0;
   for (const agent of agents.slice(1)) {
-    const agentLoad = load.get(String(agent._id)) ?? 0;
-    // Ties break on _id so assignment is deterministic, not random.
-    if (agentLoad < bestLoad || (agentLoad === bestLoad && String(agent._id) < String(best._id))) {
+    const agentLoad = load.get(agent) ?? 0;
+    // Ties break on id so assignment is deterministic, not random.
+    if (agentLoad < bestLoad || (agentLoad === bestLoad && agent < best)) {
       best = agent;
       bestLoad = agentLoad;
     }
   }
-  return best._id;
+  return best;
 }
-
-type ObjectIdLike = string;
 
 /** Role ids that hold a given permission. */
 export async function roleIdsWithPermission(permission: string): Promise<string[]> {
-  await connectDB();
-  const { Role } = await import("../models");
-  const roles = await Role.find({ [`permissions.${permission}`]: true })
-    .select("_id")
-    .lean<{ _id: ObjectIdLike }[]>();
-  return roles.map((role) => String(role._id));
+  const supabase = await connectDB();
+  // jsonb containment: permissions @> '{"assignTechnician": true}'.
+  const { data } = await supabase
+    .from("roles")
+    .select("id")
+    .contains("permissions", { [permission]: true });
+  return (data ?? []).map((role) => String(role.id));
 }
 
 export type Actor = {

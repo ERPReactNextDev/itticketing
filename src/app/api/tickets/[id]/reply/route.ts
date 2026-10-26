@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { Ticket, EmailMessage } from "@/lib/models";
+import { connectDB, DatabaseError } from "@/lib/db/supabase";
 import { requireUser, requirePermission } from "@/lib/auth/session";
+import { loadTicketDTO } from "@/lib/server/ticket-query";
 import { appendRemark } from "@/lib/server/tickets";
 import { sendTicketReply, buildTicketSubject } from "@/lib/server/resend";
 import { getSettings } from "@/lib/server/settings";
@@ -39,30 +39,18 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
 
   if (!text) throw new ApiInputError("Write a message before sending.");
 
-  await connectDB();
-
-  const ticket = await Ticket.findById(id);
+  const ticket = await loadTicketDTO(id, user);
   if (!ticket) {
-    return NextResponse.json({ error: "not_found", message: "Ticket not found." }, { status: 404 });
-  }
-
-  if (!user.permissions.editAnyTicket) {
-    const owns =
-      (ticket.technician ? String(ticket.technician) : "") === user.id ||
-      (ticket.processedBy ? String(ticket.processedBy) : "") === user.id;
-    if (!owns) {
-      return NextResponse.json(
-        { error: "forbidden", message: "You can only reply to tickets assigned to you." },
-        { status: 403 },
-      );
-    }
+    return NextResponse.json(
+      { error: "not_found", message: "Ticket not found, or you do not have access to it." },
+      { status: 404 },
+    );
   }
 
   const settings = await getSettings();
 
   // Prefer the live requestor email; fall back to the snapshot for old tickets.
-  const snapshotEmail = ticket.requestorSnapshot?.email ?? "";
-  const to = normalizeRecipients(body.to ?? snapshotEmail);
+  const to = normalizeRecipients(body.to ?? ticket.requestorEmail);
   if (to.length === 0) {
     return NextResponse.json(
       {
@@ -81,8 +69,8 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
     subject: originalSubject,
     body: text,
     to,
-    ticketId: String(ticket._id),
-    threadId: ticket.emailThreadId ?? undefined,
+    ticketId: String(ticket.id),
+    threadId: ticket.emailThreadId,
     cc: body.cc ?? [],
   });
 
@@ -93,7 +81,7 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
       actorEmail: user.email,
       action: "ticket.reply.failed",
       entity: "Ticket",
-      entityId: String(ticket._id),
+      entityId: String(ticket.id),
       ip: clientIp(req),
       userAgent: userAgent(req),
       meta: { ticketNumber: ticket.ticketNumber, error: result.error },
@@ -106,21 +94,23 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
 
   const messageId = result.messageId ?? `out-${ticket.ticketNumber}-${Date.now()}`;
 
-  await EmailMessage.create({
-    ticket: ticket._id,
+  const supabase = await connectDB();
+  const { error: insertError } = await supabase.from("email_messages").insert({
+    ticket_id: String(ticket.id),
     direction: "out",
     provider: "resend",
-    resendId: result.resendId,
-    messageId,
-    threadId: ticket.emailThreadId ?? undefined,
-    from: settings.resendFromEmail || process.env.EMAIL_FROM || "",
-    to,
-    cc: body.cc ?? [],
+    resend_id: result.resendId ?? null,
+    message_id: messageId,
+    thread_id: ticket.emailThreadId ?? null,
+    from_address: settings.resendFromEmail || process.env.EMAIL_FROM || "",
+    to_addresses: to,
+    cc_addresses: body.cc ?? [],
     subject,
-    textBody: text,
-    processedAt: new Date(),
-    autoCreatedTicket: false,
+    text_body: text,
+    processed_at: new Date().toISOString(),
+    auto_created_ticket: false,
   });
+  if (insertError) throw new DatabaseError(insertError);
 
   // The outbound email appears in the timeline as a remark, so the ticket
   // history reads as one conversation regardless of which channel it came from.
@@ -138,7 +128,7 @@ export const POST = withApi(async (req: Request, { params }: Params) => {
     actorEmail: user.email,
     action: "ticket.reply.sent",
     entity: "Ticket",
-    entityId: String(ticket._id),
+    entityId: String(ticket.id),
     ip: clientIp(req),
     userAgent: userAgent(req),
     meta: { ticketNumber: ticket.ticketNumber, to },

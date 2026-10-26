@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import * as React from "react";
 import { AppPage } from "@/components/app-page";
@@ -153,7 +153,7 @@ export default function DropdownsConfigPage() {
     <AppPage>
       <PageHeading
         title="Configuration"
-        badge={<span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">Super Admin</span>}
+        badge={<span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">SuperAdmin</span>}
         description="Every option here is editable. Changes apply to new tickets only — existing tickets keep the values they were created with."
       />
 

@@ -1,6 +1,6 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { User } from "@/lib/models";
+﻿import { NextResponse } from "next/server";
+import { connectDB, DatabaseError } from "@/lib/db/supabase";
+import { mapUserRow, userFieldsToRow } from "@/lib/db/mappers";
 import { requireUser } from "@/lib/auth/session";
 import { hashPassword, validatePasswordStrength, verifyPassword } from "@/lib/auth/password";
 import { writeAuditLog } from "@/lib/server/audit";
@@ -35,15 +35,15 @@ export const POST = withApi(async (req: Request) => {
     return NextResponse.json({ error: "weak_password", message: strength.message }, { status: 400 });
   }
 
-  await connectDB();
+  const supabase = await connectDB();
 
   const isAdminReset =
     Boolean(body.targetUserId) && body.targetUserId !== actor.id && actor.permissions.manageUsers;
 
-  let targetId: string;
+  let targetId: number;
 
   if (isAdminReset) {
-    targetId = String(body.targetUserId);
+    targetId = Number(body.targetUserId);
   } else {
     if (body.targetUserId && body.targetUserId !== actor.id) {
       return NextResponse.json(
@@ -57,7 +57,14 @@ export const POST = withApi(async (req: Request) => {
         { status: 400 },
       );
     }
-    const me = await User.findById(actor.id).select("+passwordHash");
+    const { data: meRow, error: meError } = await supabase
+      .from("users")
+      .select("*")
+      .eq("id", Number(actor.id))
+      .maybeSingle<Record<string, unknown>>();
+    if (meError) throw new DatabaseError(meError);
+
+    const me = meRow ? mapUserRow(meRow, true) : null;
     if (!me?.passwordHash) {
       return NextResponse.json({ error: "not_found", message: "Account not found." }, { status: 404 });
     }
@@ -67,25 +74,37 @@ export const POST = withApi(async (req: Request) => {
         { status: 401 },
       );
     }
-    targetId = actor.id;
+    targetId = Number(actor.id);
   }
 
-  const target = await User.findById(targetId);
-  if (!target) {
+  if (!Number.isFinite(targetId)) {
     return NextResponse.json({ error: "not_found", message: "Account not found." }, { status: 404 });
   }
 
-  await User.updateOne(
-    { _id: target._id },
-    {
-      $set: {
+  const { data: targetRow, error: targetError } = await supabase
+    .from("users")
+    .select("id, Email")
+    .eq("id", targetId)
+    .maybeSingle<Record<string, unknown>>();
+  if (targetError) throw new DatabaseError(targetError);
+  if (!targetRow) {
+    return NextResponse.json({ error: "not_found", message: "Account not found." }, { status: 404 });
+  }
+
+  const target = mapUserRow(targetRow);
+
+  const { error: updateError } = await supabase
+    .from("users")
+    .update(
+      userFieldsToRow({
         passwordHash: await hashPassword(newPassword),
         mustChangePassword: false,
         failedLoginAttempts: 0,
         lockUntil: null,
-      },
-    },
-  );
+      }),
+    )
+    .eq("id", targetId);
+  if (updateError) throw new DatabaseError(updateError);
 
   await writeAuditLog({
     actorId: actor.id,
@@ -93,7 +112,7 @@ export const POST = withApi(async (req: Request) => {
     actorEmail: actor.email,
     action: isAdminReset ? "user.password.reset" : "user.password.changed",
     entity: "User",
-    entityId: String(target._id),
+    entityId: target.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
     meta: { targetEmail: target.email },

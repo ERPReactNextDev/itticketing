@@ -1,13 +1,12 @@
 import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { Ticket } from "@/lib/models";
+import { connectDB } from "@/lib/db/supabase";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { loadTicketDTO } from "@/lib/server/ticket-query";
 import { patchTicket, appendRemark, TicketValidationError } from "@/lib/server/tickets";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
 import { withApi, readJson, ApiInputError } from "@/lib/server/http";
-import { deleteFile } from "@/lib/server/gridfs";
+import { deleteFile } from "@/lib/server/storage";
 
 export const dynamic = "force-dynamic";
 
@@ -61,7 +60,7 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
   const body = await readJson<PatchBody>(req);
 
   await connectDB();
-  const ticket = await Ticket.findById(id);
+  const ticket = await loadTicketDTO(id, user);
   if (!ticket) {
     return NextResponse.json({ error: "not_found", message: "Ticket not found." }, { status: 404 });
   }
@@ -69,8 +68,7 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
   // An agent without editAnyTicket may only edit tickets they own.
   if (!user.permissions.editAnyTicket) {
     const owns =
-      (ticket.technician ? String(ticket.technician) : "") === user.id ||
-      (ticket.processedBy ? String(ticket.processedBy) : "") === user.id;
+      (ticket.technician ?? "") === user.id || (ticket.processedBy ?? "") === user.id;
     if (!owns) {
       return NextResponse.json(
         { error: "forbidden", message: "You can only edit tickets assigned to you." },
@@ -106,13 +104,13 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
       actorEmail: user.email,
       action: "ticket.update",
       entity: "Ticket",
-      entityId: String(ticket._id),
+      entityId: String(ticket.id),
       ip: clientIp(req),
       userAgent: userAgent(req),
       meta: { changed: Object.keys(changes) },
     });
 
-    const dto = await loadTicketDTO(String(ticket._id), user);
+    const dto = await loadTicketDTO(String(ticket.id), user);
     return NextResponse.json({ ticket: dto });
   } catch (error) {
     if (error instanceof TicketValidationError) {
@@ -130,15 +128,24 @@ export const DELETE = withApi(async (req: Request, { params }: Params) => {
   requirePermission(user, "deleteTicket");
   const { id } = await params;
 
-  await connectDB();
-  const ticket = await Ticket.findById(id);
-  if (!ticket) {
+  const numericId = Number(id);
+  if (!Number.isFinite(numericId)) {
     return NextResponse.json({ error: "not_found", message: "Ticket not found." }, { status: 404 });
   }
 
-  // Remove GridFS attachments so orphaned files do not accumulate.
-  const attachmentIds = (ticket.attachments ?? []).map(String);
-  await Ticket.deleteOne({ _id: ticket._id });
+  const supabase = await connectDB();
+  const { data: row } = await supabase
+    .from("tickets")
+    .select("id, ticket_id, attachments")
+    .eq("id", numericId)
+    .maybeSingle<{ id: number; ticket_id: string | null; attachments: string[] | null }>();
+  if (!row) {
+    return NextResponse.json({ error: "not_found", message: "Ticket not found." }, { status: 404 });
+  }
+
+  // Remove stored attachments so orphaned objects do not accumulate.
+  const attachmentIds = (row.attachments ?? []).map(String);
+  await supabase.from("tickets").delete().eq("id", numericId);
   for (const fileId of attachmentIds) {
     await deleteFile(fileId);
   }
@@ -149,10 +156,10 @@ export const DELETE = withApi(async (req: Request, { params }: Params) => {
     actorEmail: user.email,
     action: "ticket.delete",
     entity: "Ticket",
-    entityId: String(ticket._id),
+    entityId: String(numericId),
     ip: clientIp(req),
     userAgent: userAgent(req),
-    meta: { ticketNumber: ticket.ticketNumber },
+    meta: { ticketNumber: row.ticket_id ?? "" },
   });
 
   return NextResponse.json({ ok: true });

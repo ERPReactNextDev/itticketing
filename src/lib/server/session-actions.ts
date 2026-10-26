@@ -1,4 +1,4 @@
-import "server-only";
+﻿import "server-only";
 import { cookies } from "next/headers";
 import { SESSION_COOKIE } from "../auth/jwt";
 import { getSettings } from "./settings";

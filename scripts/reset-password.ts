@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Admin password recovery.
  *
  * Use when you are locked out of every admin account: no password reset email
@@ -10,7 +10,7 @@
  *
  *   npx tsx --conditions react-server scripts/reset-password.ts --email <address>
  *   npx tsx --conditions react-server scripts/reset-password.ts --email <address> --password 'MyNewPass123'
- *   npx tsx --conditions react-server scripts/reset-password.ts --role "Super Admin"
+ *   npx tsx --conditions react-server scripts/reset-password.ts --role "SuperAdmin"
  *   npx tsx --conditions react-server scripts/reset-password.ts --email <address> --unlock-only
  *
  * Without `--password`, a strong one is generated and printed once.
@@ -19,8 +19,8 @@
 import "./load-env";
 
 import { randomBytes } from "crypto";
-import { connectDB } from "../src/lib/db/mongoose";
-import { Role, User } from "../src/lib/models";
+import { connectDB } from "../src/lib/db/supabase";
+import { mapRoleRow, mapUserRow, userFieldsToRow } from "../src/lib/db/mappers";
 import { hashPassword, validatePasswordStrength } from "../src/lib/auth/password";
 
 type Args = {
@@ -80,7 +80,7 @@ function parseArgs(argv: string[]): Args {
             "  npx tsx --conditions react-server scripts/reset-password.ts \\",
             "    --email you@company.com --password 'MyNewPass123'",
             "  npx tsx --conditions react-server scripts/reset-password.ts \\",
-            "    --role \"Super Admin\" --unlock-only",
+            "    --role \"SuperAdmin\" --unlock-only",
             "",
             "To see the accounts first:  npm run list-accounts",
           ].join("\n"),
@@ -114,26 +114,33 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (!args.email && !args.role) {
-    console.error("Specify --email <address> or --role \"Super Admin\". See --help.");
+    console.error("Specify --email <address> or --role \"SuperAdmin\". See --help.");
     process.exit(1);
   }
 
-  await connectDB();
+  const supabase = await connectDB();
 
   // Resolve the target accounts.
-  let filter: Record<string, unknown> = {};
+  let query = supabase.from("users").select("*");
   if (args.email) {
-    filter = { email: args.email.trim().toLowerCase() };
+    query = query.eq("Email", args.email.trim().toLowerCase());
   } else {
-    const role = await Role.findOne({ name: args.role }).lean<{ _id: unknown }>();
-    if (!role) {
+    const { data: roleRow } = await supabase
+      .from("roles")
+      .select("*")
+      .eq("name", args.role)
+      .maybeSingle<Record<string, unknown>>();
+    if (!roleRow) {
       console.error(`No role named "${args.role}".`);
       process.exit(1);
     }
-    filter = { role: role._id };
+    query = query.eq("role_id", Number(mapRoleRow(roleRow).id));
   }
 
-  const accounts = await User.find(filter).lean<Array<{ _id: unknown; email: string }>>();
+  const { data, error } = await query;
+  if (error) throw error;
+
+  const accounts = (data ?? []).map((row) => mapUserRow(row as Record<string, unknown>));
   if (accounts.length === 0) {
     console.error("No matching account. Check the address, or list the accounts first:");
     console.error("  npx tsx --conditions react-server scripts/list-accounts.ts");
@@ -156,22 +163,23 @@ async function main() {
 
   const passwordHash = password ? await hashPassword(password) : undefined;
 
+  // A recovery reset should not leave the account locked again on the very next
+  // mistake, nor stay suspended.
+  const patch = userFieldsToRow({
+    ...(passwordHash ? { passwordHash } : {}),
+    status: "active",
+    failedLoginAttempts: 0,
+    lockUntil: null,
+    // Force the owner to pick their own password at next sign-in.
+    ...(args.keepPassword ? {} : { mustChangePassword: true }),
+  });
+
   for (const account of accounts) {
-    await User.updateOne(
-      { _id: account._id },
-      {
-        $set: {
-          ...(passwordHash ? { passwordHash } : {}),
-          // A recovery reset should not leave the account locked again on the
-          // very next mistake, nor stay suspended.
-          status: "active",
-          failedLoginAttempts: 0,
-          lockUntil: null,
-          // Force the owner to pick their own password at next sign-in.
-          ...(args.keepPassword ? {} : { mustChangePassword: true }),
-        },
-      },
-    );
+    const { error: updateError } = await supabase
+      .from("users")
+      .update(patch)
+      .eq("id", Number(account.id));
+    if (updateError) throw updateError;
   }
 
   console.log(`\nUpdated ${accounts.length} account(s):`);

@@ -1,6 +1,6 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { Requestor, buildFullName } from "@/lib/models";
+﻿import { NextResponse } from "next/server";
+import { connectDB, DatabaseError } from "@/lib/db/supabase";
+import { buildFullName, mapRequestorRow, requestorFieldsToRow, type RequestorDoc } from "@/lib/db/mappers";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
@@ -27,30 +27,42 @@ export type RequestorDTO = {
   createdAt: string;
 };
 
-type Lean = Record<string, unknown>;
+type Row = Record<string, unknown>;
 
-function toDTO(doc: Lean): RequestorDTO {
+function toDTO(doc: RequestorDoc, ticketCount?: number): RequestorDTO {
   return {
-    id: String(doc._id),
-    employeeId: String(doc.employeeId ?? ""),
-    firstName: String(doc.firstName ?? ""),
-    lastName: String(doc.lastName ?? ""),
-    fullName: String(doc.fullName ?? ""),
-    email: String(doc.email ?? ""),
-    department: String(doc.department ?? ""),
-    site: String(doc.site ?? ""),
-    phone: String(doc.phone ?? ""),
-    status: String(doc.status ?? "active"),
-    notes: String(doc.notes ?? ""),
-    isGuest: Boolean(doc.isGuest),
-    ticketCount: typeof doc.ticketCount === "number" ? doc.ticketCount : undefined,
-    createdAt: String(doc.createdAt ?? ""),
+    id: doc.id,
+    employeeId: doc.employeeId,
+    firstName: doc.firstName,
+    lastName: doc.lastName,
+    fullName: doc.fullName,
+    email: doc.email,
+    department: doc.department,
+    site: doc.site,
+    phone: doc.phone,
+    status: doc.status,
+    notes: doc.notes,
+    isGuest: doc.isGuest,
+    ticketCount,
+    createdAt: doc.createdAt ?? "",
   };
+}
+
+/** Strips the characters PostgREST treats as filter delimiters / LIKE wildcards. */
+function sanitizeTerm(value: string): string {
+  return value.replace(/[(),%]/g, " ").trim();
+}
+
+/** `full_name / first_name / last_name / email / employee_id / phone` ILIKE. */
+function searchClause(raw: string, columns: string[]): string | null {
+  const term = sanitizeTerm(raw);
+  if (!term) return null;
+  return columns.map((column) => `${column}.ilike.%${term}%`).join(",");
 }
 
 export const GET = withApi(async (req: Request) => {
   const user = await requireUser();
-  await connectDB();
+  const supabase = await connectDB();
 
   const url = new URL(req.url);
 
@@ -58,22 +70,25 @@ export const GET = withApi(async (req: Request) => {
   if (url.searchParams.get("format") === "csv") {
     requirePermission(user, "exportCsv");
     const statuses = csvParam(url.searchParams.get("status"));
-    const filter: Record<string, unknown> = {};
-    if (statuses.length) filter.status = { $in: statuses };
 
-    const rows = await Requestor.find(filter).sort({ fullName: 1 }).lean<Lean[]>();
+    let query = supabase.from("requestors").select("*");
+    if (statuses.length) query = query.in("status", statuses);
+    const { data, error } = await query.order("full_name");
+    if (error) throw new DatabaseError(error);
+
+    const rows = ((data ?? []) as Row[]).map(mapRequestorRow);
     const csv = toCsv(
       ["employeeId", "firstName", "lastName", "email", "department", "site", "phone", "status", "notes"],
       rows.map((doc) => ({
-        employeeId: doc.employeeId ?? "",
-        firstName: doc.firstName ?? "",
-        lastName: doc.lastName ?? "",
-        email: doc.email ?? "",
-        department: doc.department ?? "",
-        site: doc.site ?? "",
-        phone: doc.phone ?? "",
-        status: doc.status ?? "",
-        notes: doc.notes ?? "",
+        employeeId: doc.employeeId,
+        firstName: doc.firstName,
+        lastName: doc.lastName,
+        email: doc.email,
+        department: doc.department,
+        site: doc.site,
+        phone: doc.phone,
+        status: doc.status,
+        notes: doc.notes,
       })),
     );
 
@@ -91,53 +106,37 @@ export const GET = withApi(async (req: Request) => {
       return NextResponse.json({ error: "forbidden", message: "You cannot create tickets." }, { status: 403 });
     }
     const search = (url.searchParams.get("search") ?? "").trim();
-    const filter: Record<string, unknown> = { status: "active" };
-    if (search) {
-      const safe = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const rx = new RegExp(safe, "i");
-      filter.$or = [{ fullName: rx }, { email: rx }, { employeeId: rx }];
-    }
-    const rows = await Requestor.find(filter)
-      .sort({ fullName: 1 })
-      .limit(25)
-      .lean<Lean[]>();
-    return NextResponse.json({ requestors: rows.map(toDTO) });
+    let query = supabase.from("requestors").select("*").eq("status", "active");
+    const clause = searchClause(search, ["full_name", "email", "employee_id"]);
+    if (clause) query = query.or(clause);
+    const { data, error } = await query.order("full_name").limit(25);
+    if (error) throw new DatabaseError(error);
+    return NextResponse.json({ requestors: ((data ?? []) as Row[]).map((row) => toDTO(mapRequestorRow(row))) });
   }
 
   const search = (url.searchParams.get("search") ?? "").trim();
   const statuses = csvParam(url.searchParams.get("status"));
   const departments = csvParam(url.searchParams.get("department"));
 
-  const filter: Record<string, unknown> = {};
-  if (search) {
-    const safe = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const rx = new RegExp(safe, "i");
-    filter.$or = [
-      { fullName: rx },
-      { firstName: rx },
-      { lastName: rx },
-      { email: rx },
-      { employeeId: rx },
-      { phone: rx },
-    ];
-  }
-  if (statuses.length) filter.status = { $in: statuses };
-  if (departments.length) filter.department = { $in: departments };
-
   const page = intParam(url.searchParams.get("page"), 1, { min: 1 });
   const pageSize = intParam(url.searchParams.get("pageSize"), 25, { min: 1, max: 200 });
 
-  const [rows, total] = await Promise.all([
-    Requestor.find(filter)
-      .sort({ fullName: 1 })
-      .skip((page - 1) * pageSize)
-      .limit(pageSize)
-      .lean<Lean[]>(),
-    Requestor.countDocuments(filter),
-  ]);
+  let query = supabase.from("requestors").select("*", { count: "exact" });
+  const clause = searchClause(search, ["full_name", "first_name", "last_name", "email", "employee_id", "phone"]);
+  if (clause) query = query.or(clause);
+  if (statuses.length) query = query.in("status", statuses);
+  if (departments.length) query = query.in("department", departments);
+
+  const { data, count, error } = await query
+    .order("full_name")
+    .range((page - 1) * pageSize, page * pageSize - 1);
+  if (error) throw new DatabaseError(error);
+
+  const rows = (data ?? []) as Row[];
+  const total = count ?? rows.length;
 
   return NextResponse.json({
-    requestors: rows.map(toDTO),
+    requestors: rows.map((row) => toDTO(mapRequestorRow(row))),
     total,
     page,
     pageSize,
@@ -162,7 +161,7 @@ export const POST = withApi(async (req: Request) => {
   requirePermission(user, "manageRequestors");
   const body = await readJson<CreateBody>(req);
 
-  await connectDB();
+  const supabase = await connectDB();
 
   const employeeId = (body.employeeId ?? "").trim();
   const firstName = (body.firstName ?? "").trim();
@@ -177,7 +176,11 @@ export const POST = withApi(async (req: Request) => {
     throw new ApiInputError("That email address is not valid.");
   }
 
-  const duplicate = await Requestor.findOne({ employeeId });
+  const { data: duplicate } = await supabase
+    .from("requestors")
+    .select("id")
+    .eq("employee_id", employeeId)
+    .maybeSingle<{ id: unknown }>();
   if (duplicate) {
     return NextResponse.json(
       { error: "duplicate", message: `Employee ID "${employeeId}" already exists.` },
@@ -185,21 +188,28 @@ export const POST = withApi(async (req: Request) => {
     );
   }
 
-  const doc = await Requestor.create({
-    employeeId,
-    firstName,
-    lastName,
-    fullName: buildFullName(firstName, lastName),
-    email,
-    department: (body.department ?? "").trim(),
-    site: (body.site ?? "").trim(),
-    phone: (body.phone ?? "").trim(),
-    status: DIRECTORY_STATUSES.includes((body.status ?? "") as never)
-      ? body.status
-      : "active",
-    notes: body.notes ?? "",
-    createdBy: user.id,
-  });
+  const { data, error } = await supabase
+    .from("requestors")
+    .insert(
+      requestorFieldsToRow({
+        employeeId,
+        firstName,
+        lastName,
+        fullName: buildFullName(firstName, lastName),
+        email,
+        department: (body.department ?? "").trim(),
+        site: (body.site ?? "").trim(),
+        phone: (body.phone ?? "").trim(),
+        status: DIRECTORY_STATUSES.includes((body.status ?? "") as never) ? body.status : "active",
+        notes: body.notes ?? "",
+        createdBy: user.id,
+      }),
+    )
+    .select("*")
+    .single<Row>();
+  if (error) throw new DatabaseError(error);
+
+  const doc = mapRequestorRow(data);
 
   await writeAuditLog({
     actorId: user.id,
@@ -207,11 +217,11 @@ export const POST = withApi(async (req: Request) => {
     actorEmail: user.email,
     action: "requestor.create",
     entity: "Requestor",
-    entityId: String(doc._id),
+    entityId: doc.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
     meta: { employeeId },
   });
 
-  return NextResponse.json({ requestor: toDTO(doc.toObject()) }, { status: 201 });
+  return NextResponse.json({ requestor: toDTO(doc) }, { status: 201 });
 });

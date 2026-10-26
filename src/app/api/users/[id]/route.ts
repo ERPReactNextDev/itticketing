@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { User, Role } from "@/lib/models";
+import { connectDB, getSupabase, DatabaseError } from "@/lib/db/supabase";
+import { mapUserRow, userFieldsToRow } from "@/lib/db/mappers";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
@@ -10,12 +10,15 @@ import { isSuperAdminRoleName } from "@/lib/shared/permissions";
 export const dynamic = "force-dynamic";
 
 type Params = { params: Promise<{ id: string }> };
+type Row = Record<string, unknown>;
 
-/** Guards against a Mongoose CastError on a malformed id. */
-function assertObjectId(id: string): void {
-  if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+/** Guards against a malformed id reaching PostgREST. */
+function parseUserId(id: string): number {
+  const n = Number(id);
+  if (!Number.isFinite(n)) {
     throw new ApiInputError("That user id is not valid.");
   }
+  return n;
 }
 
 type UpdateBody = {
@@ -35,15 +38,21 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
   const actor = await requireUser();
   requirePermission(actor, "manageUsers");
   const { id } = await params;
-  assertObjectId(id);
+  const userId = parseUserId(id);
   const body = await readJson<UpdateBody>(req);
 
-  await connectDB();
-  const target = await User.findById(id);
-  if (!target) {
+  const supabase = await connectDB();
+  const { data: targetRow, error: targetError } = await supabase
+    .from("users")
+    .select("*")
+    .eq("id", userId)
+    .maybeSingle<Row>();
+  if (targetError) throw new DatabaseError(targetError);
+  if (!targetRow) {
     return NextResponse.json({ error: "not_found", message: "User not found." }, { status: 404 });
   }
 
+  const target = mapUserRow(targetRow);
   const set: Record<string, unknown> = {};
 
   if (body.name !== undefined) {
@@ -57,7 +66,13 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       throw new ApiInputError("That email address is not valid.");
     }
-    const clash = await User.findOne({ email, _id: { $ne: target._id } });
+    const { data: clash, error: clashError } = await supabase
+      .from("users")
+      .select("id")
+      .eq("Email", email)
+      .neq("id", userId)
+      .maybeSingle<{ id: unknown }>();
+    if (clashError) throw new DatabaseError(clashError);
     if (clash) {
       return NextResponse.json(
         { error: "duplicate", message: "A user with that email already exists." },
@@ -84,47 +99,58 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
   }
 
   if (body.roleId !== undefined) {
-    if (!/^[0-9a-fA-F]{24}$/.test(body.roleId)) {
+    const roleId = Number(body.roleId);
+    if (!Number.isFinite(roleId)) {
       throw new ApiInputError("That role id is not valid.");
     }
-    const role = await Role.findById(body.roleId);
+    const { data: role, error: roleError } = await supabase
+      .from("roles")
+      .select("id")
+      .eq("id", roleId)
+      .maybeSingle<{ id: unknown }>();
+    if (roleError) throw new DatabaseError(roleError);
     if (!role) throw new ApiInputError("That role does not exist.");
 
-    // Guard against removing the last Super Admin, which would lock everyone
-    // out of role management permanently.
-    if (
-      target._id.toString() !== actor.id &&
-      isSuperAdminRoleName(await currentRoleName(target.role as string))
-    ) {
-      const superAdmins = await countSuperAdmins();
-      if (superAdmins <= 1) {
+    // Guard against removing the last SuperAdmin, which would lock everyone
+    // out of the system.
+    const isTargetSuperAdmin = isSuperAdminRoleName(await currentRoleName(target.roleId));
+    if (isTargetSuperAdmin) {
+      const { count: superAdminCount } = await supabase
+        .from("users")
+        .select("*", { count: "exact", head: true })
+        .eq("role_id", target.roleId)
+        .eq("Status", "active");
+
+      if ((superAdminCount ?? 0) <= 1) {
         return NextResponse.json(
           {
-            error: "last_super_admin",
+            error: "forbidden",
             message:
-              "This is the only Super Admin account. Promote another account to Super Admin before changing this one.",
+              "This is the only SuperAdmin account. Promote another account to SuperAdmin before changing this one.",
           },
-          { status: 409 },
+          { status: 403 },
         );
       }
     }
-    set.role = role._id;
+    set.roleId = String(roleId);
   }
 
-  // An admin must not be able to suspend or demote their own account and lock
-  // themselves out mid-session.
-  if (target._id.toString() === actor.id) {
-    if (set.status === "suspended") {
-      return NextResponse.json(
-        { error: "self_lockout", message: "You cannot suspend your own account." },
-        { status: 409 },
-      );
-    }
+  // An admin must not be able to suspend their own account and lock themselves
+  // out mid-session.
+  if (target.id === actor.id && set.status === "suspended") {
+    return NextResponse.json(
+      { error: "self_lockout", message: "You cannot suspend your own account." },
+      { status: 409 },
+    );
   }
 
   if (Object.keys(set).length === 0) throw new ApiInputError("Nothing to update.");
 
-  await User.updateOne({ _id: target._id }, { $set: set });
+  const { error: updateError } = await supabase
+    .from("users")
+    .update(userFieldsToRow(set))
+    .eq("id", userId);
+  if (updateError) throw new DatabaseError(updateError);
 
   await writeAuditLog({
     actorId: actor.id,
@@ -132,32 +158,38 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
     actorEmail: actor.email,
     action: "user.update",
     entity: "User",
-    entityId: String(target._id),
+    entityId: target.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
     meta: { changed: Object.keys(set) },
   });
 
-  const updated = await User.findById(target._id).lean<Record<string, unknown>>();
-  if (!updated) {
+  const { data: updatedRow, error: readError } = await supabase
+    .from("users")
+    .select("*")
+    .eq("id", userId)
+    .maybeSingle<Row>();
+  if (readError) throw new DatabaseError(readError);
+  if (!updatedRow) {
     return NextResponse.json({ error: "not_found", message: "User not found." }, { status: 404 });
   }
-  const role = await Role.findById(updated.role as string).lean<{ name?: string }>();
+
+  const updated = mapUserRow(updatedRow);
 
   return NextResponse.json({
     user: {
-      id: String(updated._id),
-      name: String(updated.name ?? ""),
-      email: String(updated.email ?? ""),
-      employeeId: String(updated.employeeId ?? ""),
-      roleId: String(updated.role ?? ""),
-      roleName: role?.name ?? "",
-      department: String(updated.department ?? ""),
-      site: String(updated.site ?? ""),
-      position: String(updated.position ?? ""),
-      phone: String(updated.phone ?? ""),
-      status: String(updated.status ?? "active"),
-      avatarUrl: String(updated.avatarUrl ?? ""),
+      id: updated.id,
+      name: updated.name,
+      email: updated.email,
+      employeeId: updated.employeeId,
+      roleId: updated.roleId,
+      roleName: await currentRoleName(updated.roleId),
+      department: updated.department,
+      site: updated.site,
+      position: updated.position,
+      phone: updated.phone,
+      status: updated.status,
+      avatarUrl: updated.avatarUrl,
     },
   });
 });
@@ -167,27 +199,35 @@ export const DELETE = withApi(async (req: Request, { params }: Params) => {
   const actor = await requireUser();
   requirePermission(actor, "manageUsers");
   const { id } = await params;
-  assertObjectId(id);
+  const userId = parseUserId(id);
 
-  if (id === actor.id) {
+  if (userId === Number(actor.id)) {
     return NextResponse.json(
       { error: "self_lockout", message: "You cannot remove your own account." },
       { status: 409 },
     );
   }
 
-  await connectDB();
-  const target = await User.findById(id);
-  if (!target) {
+  const supabase = await connectDB();
+  const { data: targetRow, error: targetError } = await supabase
+    .from("users")
+    .select("*")
+    .eq("id", userId)
+    .maybeSingle<Row>();
+  if (targetError) throw new DatabaseError(targetError);
+  if (!targetRow) {
     return NextResponse.json({ error: "not_found", message: "User not found." }, { status: 404 });
   }
 
+  const target = mapUserRow(targetRow);
+
   // Users are referenced by processedBy / technician / closedBy on historical
   // tickets, so they are suspended rather than hard-deleted.
-  await User.updateOne(
-    { _id: target._id },
-    { $set: { status: "suspended", lockUntil: null } },
-  );
+  const { error: updateError } = await supabase
+    .from("users")
+    .update({ Status: "suspended", lock_until: null })
+    .eq("id", userId);
+  if (updateError) throw new DatabaseError(updateError);
 
   await writeAuditLog({
     actorId: actor.id,
@@ -195,7 +235,7 @@ export const DELETE = withApi(async (req: Request, { params }: Params) => {
     actorEmail: actor.email,
     action: "user.suspend",
     entity: "User",
-    entityId: String(target._id),
+    entityId: target.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
   });
@@ -204,12 +244,29 @@ export const DELETE = withApi(async (req: Request, { params }: Params) => {
 });
 
 async function currentRoleName(roleId: string): Promise<string> {
-  const role = await Role.findById(roleId).lean<{ name?: string }>();
-  return role?.name ?? "";
+  if (!roleId) return "";
+  const supabase = getSupabase();
+  const { data } = await supabase
+    .from("roles")
+    .select("name")
+    .eq("id", Number(roleId))
+    .maybeSingle<{ name: string }>();
+  return data?.name ?? "";
 }
 
 async function countSuperAdmins(): Promise<number> {
-  const superAdminRole = await Role.findOne({ name: "Super Admin" });
+  const supabase = getSupabase();
+  const { data: superAdminRole } = await supabase
+    .from("roles")
+    .select("id")
+    .eq("name", "Super Admin")
+    .maybeSingle<{ id: unknown }>();
   if (!superAdminRole) return 0;
-  return User.countDocuments({ role: superAdminRole._id, status: "active" });
+
+  const { count } = await supabase
+    .from("users")
+    .select("id", { count: "exact", head: true })
+    .eq("role_id", Number(superAdminRole.id))
+    .ilike("Status", "active");
+  return count ?? 0;
 }

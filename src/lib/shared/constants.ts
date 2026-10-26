@@ -1,4 +1,4 @@
-/** Enumerations shared by Mongoose schemas, API routes and the UI. */
+﻿/** Enumerations shared by Mongoose schemas, API routes and the UI. */
 
 export const DROPDOWN_TYPES = [
   "department",

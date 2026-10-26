@@ -1,6 +1,6 @@
-import { NextResponse, type NextRequest } from "next/server";
+﻿import { NextResponse, type NextRequest } from "next/server";
 import { jwtVerify } from "jose";
-import { enforce, globalApiRule } from "@/lib/server/rate-limit";
+import { enforce, globalApiRule } from "./lib/server/rate-limit";
 
 /**
  * Route protection + the global API rate limit.
@@ -18,7 +18,7 @@ import { enforce, globalApiRule } from "@/lib/server/rate-limit";
 const SESSION_COOKIE = "itd_session";
 
 /** Routes that work without a session. */
-const PUBLIC_PATHS = ["/login", "/api/auth/login", "/api/webhooks/resend"];
+const PUBLIC_PATHS = ["/login", "/register", "/api/auth/login", "/api/auth/register", "/api/webhooks/resend"];
 
 function isPublic(pathname: string): boolean {
   if (pathname === "/") return true;
@@ -51,7 +51,7 @@ async function hasValidSession(req: NextRequest): Promise<boolean> {
 export async function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  // Global per-IP API ceiling, thresholds read live from system_settings.
+  // Global per-IP API ceiling, thresholds read live from app_settings.
   if (pathname.startsWith("/api/") && !pathname.startsWith("/api/webhooks/")) {
     const limited = await enforce(await globalApiRule(req as unknown as Request));
     if (limited) return limited;

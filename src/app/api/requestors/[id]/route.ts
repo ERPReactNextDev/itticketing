@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { Requestor, Ticket, buildFullName } from "@/lib/models";
+import { connectDB, DatabaseError } from "@/lib/db/supabase";
+import { buildFullName, mapRequestorRow, requestorFieldsToRow } from "@/lib/db/mappers";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
@@ -11,11 +11,13 @@ export const dynamic = "force-dynamic";
 
 type Params = { params: Promise<{ id: string }> };
 
-/** Guards against a Mongoose CastError on a malformed id. */
-function assertObjectId(id: string): void {
-  if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+/** Supabase ids are bigint, so a non-numeric id must fail cleanly. */
+function parseRequestorId(id: string): number {
+  const n = Number(id);
+  if (!Number.isFinite(n) || String(n) !== id.trim()) {
     throw new ApiInputError("That requestor id is not valid.");
   }
+  return n;
 }
 
 type UpdateBody = {
@@ -34,21 +36,31 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
   const user = await requireUser();
   requirePermission(user, "manageRequestors");
   const { id } = await params;
-  assertObjectId(id);
+  const requestorId = parseRequestorId(id);
   const body = await readJson<UpdateBody>(req);
 
-  await connectDB();
-  const doc = await Requestor.findById(id);
-  if (!doc) {
+  const supabase = await connectDB();
+  const { data: row } = await supabase
+    .from("requestors")
+    .select("*")
+    .eq("id", requestorId)
+    .maybeSingle<Record<string, unknown>>();
+  if (!row) {
     return NextResponse.json({ error: "not_found", message: "Requestor not found." }, { status: 404 });
   }
+  const doc = mapRequestorRow(row);
 
   const set: Record<string, unknown> = {};
 
   if (body.employeeId !== undefined) {
     const employeeId = body.employeeId.trim();
     if (!employeeId) throw new ApiInputError("Employee ID cannot be empty.");
-    const clash = await Requestor.findOne({ employeeId, _id: { $ne: doc._id } });
+    const { data: clash } = await supabase
+      .from("requestors")
+      .select("id")
+      .eq("employee_id", employeeId)
+      .neq("id", requestorId)
+      .maybeSingle<{ id: unknown }>();
     if (clash) {
       return NextResponse.json(
         { error: "duplicate", message: `Employee ID "${employeeId}" is already in use.` },
@@ -88,7 +100,13 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
 
   if (Object.keys(set).length === 0) throw new ApiInputError("Nothing to update.");
 
-  await Requestor.updateOne({ _id: doc._id }, { $set: set });
+  const { data: updated, error } = await supabase
+    .from("requestors")
+    .update(requestorFieldsToRow(set))
+    .eq("id", requestorId)
+    .select("*")
+    .single<Record<string, unknown>>();
+  if (error) throw new DatabaseError(error);
 
   await writeAuditLog({
     actorId: user.id,
@@ -96,40 +114,44 @@ export const PATCH = withApi(async (req: Request, { params }: Params) => {
     actorEmail: user.email,
     action: "requestor.update",
     entity: "Requestor",
-    entityId: String(doc._id),
+    entityId: doc.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
     meta: { changed: Object.keys(set) },
   });
 
-  const updated = await Requestor.findById(doc._id).lean<Record<string, unknown>>();
-  return NextResponse.json({ requestor: updated });
+  return NextResponse.json({ requestor: mapRequestorRow(updated) });
 });
 
 export const DELETE = withApi(async (req: Request, { params }: Params) => {
   const user = await requireUser();
   requirePermission(user, "manageRequestors");
   const { id } = await params;
-  assertObjectId(id);
+  const requestorId = parseRequestorId(id);
 
-  await connectDB();
+  const supabase = await connectDB();
 
   // Deleting a requestor would orphan the historical tickets that reference
   // them. The ticket keeps its embedded snapshot, but the link is lost, so
   // block deletion while tickets exist and offer deactivation instead.
-  const ticketCount = await Ticket.countDocuments({ requestor: id });
-  if (ticketCount > 0) {
+  const { count: ticketCount } = await supabase
+    .from("tickets")
+    .select("id", { count: "exact", head: true })
+    .eq("requestor_id", String(requestorId));
+  if ((ticketCount ?? 0) > 0) {
+    const count = ticketCount ?? 0;
     return NextResponse.json(
       {
         error: "has_tickets",
-        message: `This requestor is linked to ${ticketCount} ticket${ticketCount === 1 ? "" : "s"}. Set them to Inactive instead of deleting so ticket history stays intact.`,
-        ticketCount,
+        message: `This requestor is linked to ${count} ticket${count === 1 ? "" : "s"}. Set them to Inactive instead of deleting so ticket history stays intact.`,
+        ticketCount: count,
       },
       { status: 409 },
     );
   }
 
-  await Requestor.deleteOne({ _id: id });
+  const { error } = await supabase.from("requestors").delete().eq("id", requestorId);
+  if (error) throw new DatabaseError(error);
 
   await writeAuditLog({
     actorId: user.id,
@@ -137,7 +159,7 @@ export const DELETE = withApi(async (req: Request, { params }: Params) => {
     actorEmail: user.email,
     action: "requestor.delete",
     entity: "Requestor",
-    entityId: id,
+    entityId: String(requestorId),
     ip: clientIp(req),
     userAgent: userAgent(req),
   });

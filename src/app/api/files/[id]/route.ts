@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
-import { readFile, isValidFileId } from "@/lib/server/gridfs";
+import { readFile, isValidFileId } from "@/lib/server/storage";
 import { withApi } from "@/lib/server/http";
 
 export const dynamic = "force-dynamic";
@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 type Params = { params: Promise<{ id: string }> };
 
 /**
- * Streams a GridFS attachment.
+ * Streams a stored attachment out of Supabase Storage.
  *
  * Requires a session. Authorization is intentionally coarse: any signed-in user
  * who can see a ticket may download its attachments, matching the ticket-level

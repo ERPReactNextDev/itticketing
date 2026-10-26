@@ -1,6 +1,5 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { Requestor } from "@/lib/models";
+﻿import { NextResponse } from "next/server";
+import { connectDB, DatabaseError } from "@/lib/db/supabase";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
@@ -23,12 +22,18 @@ export const POST = withApi(async (req: Request) => {
     throw new ApiInputError("Unknown bulk action.");
   }
 
-  await connectDB();
+  const supabase = await connectDB();
   const status = body.action === "activate" ? "active" : "inactive";
-  const result = await Requestor.updateMany(
-    { _id: { $in: ids } },
-    { $set: { status } },
-  );
+  const numericIds = ids.map((id) => Number(id)).filter((id) => Number.isFinite(id));
+
+  const { data, error } = await supabase
+    .from("requestors")
+    .update({ status })
+    .in("id", numericIds)
+    .select("id");
+  if (error) throw new DatabaseError(error);
+
+  const updated = data?.length ?? 0;
 
   await writeAuditLog({
     actorId: user.id,
@@ -38,8 +43,8 @@ export const POST = withApi(async (req: Request) => {
     entity: "Requestor",
     ip: clientIp(req),
     userAgent: userAgent(req),
-    meta: { count: result.modifiedCount },
+    meta: { count: updated },
   });
 
-  return NextResponse.json({ ok: true, updated: result.modifiedCount ?? 0 });
+  return NextResponse.json({ ok: true, updated });
 });

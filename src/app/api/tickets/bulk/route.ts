@@ -1,11 +1,13 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { Ticket, User } from "@/lib/models";
+﻿import { NextResponse } from "next/server";
+import { connectDB, unwrap } from "@/lib/db/supabase";
+import { composeUserName, normalizeUserStatus } from "@/lib/db/mappers";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { patchTicket } from "@/lib/server/tickets";
+import { roleIdsWithPermission } from "@/lib/server/actor";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
 import { withApi, readJson } from "@/lib/server/http";
+import { deleteFile } from "@/lib/server/storage";
 
 export const dynamic = "force-dynamic";
 
@@ -42,11 +44,29 @@ export const POST = withApi(async (req: Request) => {
     );
   }
 
-  await connectDB();
+  const numericIds = ids.map(Number).filter((value) => Number.isFinite(value));
+  const supabase = await connectDB();
 
   if (body.action === "delete") {
     requirePermission(user, "deleteTicket");
-    const result = await Ticket.deleteMany({ _id: { $in: ids } });
+
+    // Attachment ids are read *before* the delete so their stored objects can be
+    // cleaned up; the delete itself only returns the ticket rows.
+    const { data: rows } = await supabase
+      .from("tickets")
+      .select("id, attachments")
+      .in("id", numericIds);
+    const attachmentIds = (rows ?? []).flatMap((row) =>
+      (Array.isArray(row.attachments) ? row.attachments : []).map(String),
+    );
+
+    const deleted = unwrap(
+      await supabase.from("tickets").delete().in("id", numericIds).select("id"),
+    );
+    for (const fileId of attachmentIds) {
+      await deleteFile(fileId);
+    }
+
     await writeAuditLog({
       actorId: user.id,
       actorName: user.name,
@@ -55,39 +75,47 @@ export const POST = withApi(async (req: Request) => {
       entity: "Ticket",
       ip: clientIp(req),
       userAgent: userAgent(req),
-      meta: { count: result.deletedCount },
+      meta: { count: deleted.length },
     });
-    return NextResponse.json({ ok: true, updated: result.deletedCount ?? 0 });
+    return NextResponse.json({ ok: true, updated: deleted.length });
   }
 
-  const tickets = await Ticket.find({ _id: { $in: ids } });
+  // Check the permission once, before the loop: an action the caller is not
+  // allowed to perform must fail the whole request, not silently skip tickets.
+  if (body.action === "assign") {
+    requirePermission(user, "assignTechnician");
+  } else if (body.action === "status") {
+    if (!body.status) {
+      return NextResponse.json(
+        { error: "bad_request", message: "A status value is required." },
+        { status: 400 },
+      );
+    }
+    // Closing needs closeTicket; other transitions need changeStatus.
+    requirePermission(user, isClosingStatus(body.status) ? "closeTicket" : "changeStatus");
+  }
+
+  const { data: rows } = await supabase.from("tickets").select("id").in("id", numericIds);
+
   let updated = 0;
   const skipped: Array<{ id: string; reason: string }> = [];
 
-  for (const ticket of tickets) {
+  for (const row of rows ?? []) {
+    const ticketId = String(row.id);
     try {
       if (body.action === "assign") {
-        requirePermission(user, "assignTechnician");
-        await patchTicket(ticket, { technician: body.technicianId ?? null }, user, {
+        await patchTicket({ id: ticketId }, { technician: body.technicianId ?? null }, user, {
           allowed: new Set(["technician"]),
         });
-        updated += 1;
-      } else if (body.action === "status") {
-        if (!body.status) {
-          return NextResponse.json(
-            { error: "bad_request", message: "A status value is required." },
-            { status: 400 },
-          );
-        }
-        // Closing needs closeTicket; other transitions need changeStatus.
-        const permission = isClosingStatus(body.status) ? "closeTicket" : "changeStatus";
-        requirePermission(user, permission);
-        await patchTicket(ticket, { status: body.status }, user, { allowed: new Set(["status"]) });
-        updated += 1;
+      } else {
+        await patchTicket({ id: ticketId }, { status: body.status }, user, {
+          allowed: new Set(["status"]),
+        });
       }
+      updated += 1;
     } catch (error) {
       skipped.push({
-        id: String(ticket._id),
+        id: ticketId,
         reason: error instanceof Error ? error.message : "Update failed.",
       });
     }
@@ -117,19 +145,29 @@ export const GET = withApi(async () => {
   if (!user.permissions.assignTechnician) {
     return NextResponse.json({ technicians: [] });
   }
-  const { roleIdsWithPermission } = await import("@/lib/server/actor");
-  const roleIds = await roleIdsWithPermission("assignTechnician");
-  const technicians = await User.find({ status: "active", role: { $in: roleIds } })
-    .select("name email department")
-    .sort({ name: 1 })
-    .lean<Array<{ _id: unknown; name?: string; email?: string; department?: string }>>();
 
-  return NextResponse.json({
-    technicians: technicians.map((tech) => ({
-      id: String(tech._id),
-      name: tech.name ?? "",
-      email: tech.email ?? "",
-      department: tech.department ?? "",
-    })),
-  });
+  const roleIds = await roleIdsWithPermission("assignTechnician");
+  if (roleIds.length === 0) {
+    return NextResponse.json({ technicians: [] });
+  }
+
+  const supabase = await connectDB();
+  const { data } = await supabase
+    .from("users")
+    .select("id, Firstname, Lastname, Email, Department, Status")
+    .in("role_id", roleIds.map(Number));
+
+  const technicians = (data ?? [])
+    // The legacy `Status` column is free-form, so the active check runs through
+    // the same normaliser the rest of the app uses.
+    .filter((row) => normalizeUserStatus(row.Status) === "active")
+    .map((row) => ({
+      id: String(row.id),
+      name: composeUserName(row),
+      email: String(row.Email ?? ""),
+      department: String(row.Department ?? ""),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return NextResponse.json({ technicians });
 });

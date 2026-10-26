@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Client-safe formatting helpers.
  *
  * Kept separate from `lib/shared/time.ts`, which imports Node-only helpers, so

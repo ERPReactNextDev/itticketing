@@ -30,7 +30,7 @@ export const PERMISSION_KEYS = [
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 export type PermissionSet = Record<PermissionKey, boolean>;
 
-/** Human labels for the RBAC matrix editor in Super Admin. */
+/** Human labels for the RBAC matrix editor in SuperAdmin. */
 export const PERMISSION_LABELS: Record<PermissionKey, { label: string; hint: string }> = {
   manageUsers: { label: "Manage Staff / Agents", hint: "Create, edit, suspend and reset login accounts" },
   manageRequestors: { label: "Manage Requestors", hint: "Edit the employee directory and CSV import" },
@@ -70,18 +70,18 @@ export const NO_PERMISSIONS: PermissionSet = PERMISSION_KEYS.reduce(
   {} as PermissionSet,
 );
 
-export type SystemRoleName = "Super Admin" | "Admin" | "Agent" | "Viewer";
+export type SystemRoleName = "SuperAdmin" | "Admin" | "Agent" | "Viewer";
 
 /**
- * Seeded role templates. Super Admin is intentionally the only role that can
+ * Seeded role templates. SuperAdmin is intentionally the only role that can
  * lock itself out of `manageRoles` / `manageSettings`.
  */
 export const SYSTEM_ROLE_DEFAULTS: Record<
   SystemRoleName,
   { name: string; description: string; permissions: PermissionSet }
 > = {
-  "Super Admin": {
-    name: "Super Admin",
+  "SuperAdmin": {
+    name: "SuperAdmin",
     description: "Unrestricted access. Manages roles, settings and every ticket.",
     permissions: { ...ALL_PERMISSIONS },
   },
@@ -94,7 +94,7 @@ export const SYSTEM_ROLE_DEFAULTS: Record<
       manageRequestors: true,
       manageDropdowns: true,
       manageSettings: true,
-      // manageRoles stays false - only Super Admin may change the matrix.
+      // manageRoles stays false - only SuperAdmin may change the matrix.
       manageRoles: false,
       viewDashboard: true,
       viewAllTickets: true,
@@ -150,5 +150,5 @@ export function normalizePermissions(input: unknown): PermissionSet {
 }
 
 export function isSuperAdminRoleName(name: string | undefined | null): boolean {
-  return (name ?? "").trim().toLowerCase() === "super admin";
+  return (name ?? "").trim().toLowerCase() === "superadmin";
 }

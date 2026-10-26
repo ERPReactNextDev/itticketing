@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Typed fetch wrapper for the app's API routes.
  *
  * Every call goes through here so error handling is uniform: the API returns

@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { getSettings, saveSettings } from "@/lib/server/settings";
 import { withApi, readJson, ApiInputError } from "@/lib/server/http";

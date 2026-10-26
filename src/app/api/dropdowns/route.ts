@@ -1,37 +1,37 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { DropdownOption, Ticket } from "@/lib/models";
-import { requireUser } from "@/lib/auth/session";
+﻿import { NextResponse } from "next/server";
+import { connectDB, DatabaseError } from "@/lib/db/supabase";
+import { dropdownFieldsToRow, mapDropdownRow, num } from "@/lib/db/mappers";
+import { requireUser, requirePermission } from "@/lib/auth/session";
 import { DROPDOWN_TYPES, type DropdownType } from "@/lib/shared/constants";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
 import { withApi, readJson, ApiInputError } from "@/lib/server/http";
-import { requirePermission } from "@/lib/auth/session";
 
 export const dynamic = "force-dynamic";
 
-type Lean = Record<string, unknown>;
+type Row = Record<string, unknown>;
 
 /**
- * Guards a string against being handed to a Mongoose ObjectId cast.
+ * Parses a Supabase row id.
  *
- * Without this, `?id=accounting` throws a CastError that surfaces as a 500
- * instead of a clean 404.
+ * Ids are bigint now, so a non-numeric `?id=` must fail the lookup cleanly
+ * instead of being coerced into `NaN` and hitting the database.
  */
-function isObjectId(value: string): boolean {
-  return /^[0-9a-fA-F]{24}$/.test(value);
+function parseId(value: string): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && String(n) === value.trim() ? n : null;
 }
 
-function toDTO(doc: Lean) {
+function toDTO(doc: ReturnType<typeof mapDropdownRow>) {
   return {
-    id: String(doc._id),
-    type: String(doc.type ?? ""),
-    label: String(doc.label ?? ""),
-    value: String(doc.value ?? ""),
-    order: Number(doc.order ?? 0),
-    active: doc.active !== false,
-    slaHours: typeof doc.slaHours === "number" ? doc.slaHours : undefined,
-    color: doc.color ? String(doc.color) : undefined,
+    id: doc.id,
+    type: doc.type,
+    label: doc.label,
+    value: doc.value,
+    order: doc.order,
+    active: doc.active,
+    slaHours: doc.slaHours,
+    color: doc.color,
   };
 }
 
@@ -46,6 +46,18 @@ function slugify(label: string): string {
     .slice(0, 60);
 }
 
+/** Ticket column that stores an option's `value`, keyed by dropdown type. */
+const TICKET_FIELD_BY_TYPE: Record<string, string> = {
+  department: "department",
+  requestType: "request_type",
+  typeOfConcern: "type_concern",
+  mode: "mode",
+  servicesGroup: "group_services",
+  site: "site",
+  status: "status",
+  priority: "priority_data->>value",
+};
+
 /**
  * Reads dropdown options.
  *
@@ -55,7 +67,7 @@ function slugify(label: string): string {
  */
 export const GET = withApi(async (req: Request) => {
   const user = await requireUser();
-  await connectDB();
+  const supabase = await connectDB();
 
   const url = new URL(req.url);
   const typeParam = url.searchParams.get("type");
@@ -68,28 +80,32 @@ export const GET = withApi(async (req: Request) => {
     );
   }
 
-  const filter: Record<string, unknown> = {};
+  let query = supabase.from("dropdown_options").select("*");
   if (typeParam) {
     if (!DROPDOWN_TYPES.includes(typeParam as DropdownType)) {
       throw new ApiInputError(`Unknown dropdown type "${typeParam}".`);
     }
-    filter.type = typeParam;
+    query = query.eq("type", typeParam);
   }
-  if (!includeInactive) filter.active = true;
+  if (!includeInactive) query = query.eq("active", true);
 
-  const rows = await DropdownOption.find(filter)
-    .sort({ type: 1, order: 1, label: 1 })
-    .lean<Lean[]>();
+  const { data, error } = await query
+    .order("type")
+    .order("sort_order")
+    .order("label");
+  if (error) throw new DatabaseError(error);
+
+  const rows = (data ?? []) as Row[];
+  const options = rows.map((row) => toDTO(mapDropdownRow(row)));
 
   // Grouped response is what the Configuration tabs and the form both want.
   const grouped: Record<string, ReturnType<typeof toDTO>[]> = {};
-  for (const doc of rows) {
-    const key = String(doc.type);
-    grouped[key] ??= [];
-    grouped[key].push(toDTO(doc));
+  for (const option of options) {
+    grouped[option.type] ??= [];
+    grouped[option.type].push(option);
   }
 
-  return NextResponse.json({ options: rows.map(toDTO), grouped });
+  return NextResponse.json({ options, grouped });
 });
 
 type WriteBody = {
@@ -121,9 +137,21 @@ export const POST = withApi(async (req: Request) => {
   const value = (body.value ?? slugify(label)).trim();
   if (!value) throw new ApiInputError("Value is required.");
 
-  await connectDB();
+  const supabase = await connectDB();
 
-  const labelClash = await DropdownOption.findOne({ type, label, ...(body.id ? { _id: { $ne: body.id } } : {}) });
+  const targetId = body.id ? parseId(body.id) : null;
+  if (body.id && targetId === null) throw new ApiInputError("That option id is not valid.");
+
+  // The unique (type, label) index is per-row, so an update must look past
+  // itself before claiming the label is free.
+  let clashQuery = supabase
+    .from("dropdown_options")
+    .select("id")
+    .eq("type", type)
+    .eq("label", label);
+  if (targetId !== null) clashQuery = clashQuery.neq("id", targetId);
+  const { data: labelClash } = await clashQuery.maybeSingle<{ id: unknown }>();
+
   if (labelClash) {
     return NextResponse.json(
       { error: "duplicate", message: `"${label}" already exists in this list.` },
@@ -131,51 +159,65 @@ export const POST = withApi(async (req: Request) => {
     );
   }
 
-  const set: Record<string, unknown> = { type, label, value };
-  if (body.order !== undefined) set.order = Number(body.order);
-  if (body.active !== undefined) set.active = Boolean(body.active);
+  const fields: Record<string, unknown> = { type, label, value };
+  if (body.order !== undefined) fields.order = num(body.order, 0);
+  if (body.active !== undefined) fields.active = Boolean(body.active);
   if (type === "priority" && body.slaHours !== undefined) {
     const hours = Number(body.slaHours);
     if (!Number.isFinite(hours) || hours <= 0) {
       throw new ApiInputError("SLA hours must be a positive number.");
     }
-    set.slaHours = hours;
+    fields.slaHours = hours;
   }
-  if (body.color !== undefined && body.color !== "") set.color = body.color;
+  if (body.color !== undefined && body.color !== "") fields.color = body.color;
 
-  let doc;
-  if (body.id) {
-    if (!isObjectId(body.id)) throw new ApiInputError("That option id is not valid.");
-    doc = await DropdownOption.findByIdAndUpdate(
-      body.id,
-      { $set: set },
-      { new: true },
-    ).lean<Lean>();
-    if (!doc) {
+  let doc: ReturnType<typeof mapDropdownRow>;
+
+  if (targetId !== null) {
+    const { data, error } = await supabase
+      .from("dropdown_options")
+      .update(dropdownFieldsToRow(fields))
+      .eq("id", targetId)
+      .select("*")
+      .maybeSingle<Row>();
+    if (error) throw new DatabaseError(error);
+    if (!data) {
       return NextResponse.json({ error: "not_found", message: "Option not found." }, { status: 404 });
     }
+    doc = mapDropdownRow(data);
   } else {
     if (body.order === undefined) {
-      const max = await DropdownOption.findOne({ type }).sort({ order: -1 }).lean<{ order?: number }>();
-      set.order = (max?.order ?? -1) + 1;
+      const { data: max } = await supabase
+        .from("dropdown_options")
+        .select("sort_order")
+        .eq("type", type)
+        .order("sort_order", { ascending: false })
+        .limit(1)
+        .maybeSingle<{ sort_order: number | null }>();
+      fields.order = num(max?.sort_order, -1) + 1;
     }
-    doc = await DropdownOption.create(set);
-    doc = doc.toObject();
+    const { data, error } = await supabase
+      .from("dropdown_options")
+      .insert(dropdownFieldsToRow(fields))
+      .select("*")
+      .single<Row>();
+    if (error) throw new DatabaseError(error);
+    doc = mapDropdownRow(data);
   }
 
   await writeAuditLog({
     actorId: user.id,
     actorName: user.name,
     actorEmail: user.email,
-    action: body.id ? "dropdown.update" : "dropdown.create",
+    action: targetId !== null ? "dropdown.update" : "dropdown.create",
     entity: "DropdownOption",
-    entityId: String(doc._id),
+    entityId: doc.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
     meta: { type, label },
   });
 
-  return NextResponse.json({ option: toDTO(doc) }, { status: body.id ? 200 : 201 });
+  return NextResponse.json({ option: toDTO(doc) }, { status: targetId !== null ? 200 : 201 });
 });
 
 type PatchBody = { active?: boolean };
@@ -189,21 +231,30 @@ export const PATCH = withApi(async (req: Request) => {
   if (!id) throw new ApiInputError("An option id is required.");
 
   const body = await readJson<PatchBody>(req);
-  await connectDB();
+  const supabase = await connectDB();
 
-  // Accept the document id or, for convenience in tests and scripts, the
-  // stable `value` slug. Guard the cast so a typo returns a 404 rather than a
-  // 500 from an unhandled CastError.
-  const filter = isObjectId(id) ? { _id: id } : { value: id };
-  const doc = await DropdownOption.findOneAndUpdate(
-    filter,
-    { $set: { active: Boolean(body.active) } },
-    { new: true },
-  ).lean<Lean>();
+  // Accept the numeric id or, for convenience in tests and scripts, the stable
+  // `value` slug - resolved with a read so a typo returns a clean 404.
+  const numericId = parseId(id);
+  const lookup = supabase.from("dropdown_options").select("id");
+  const { data: existing } = await (numericId !== null
+    ? lookup.eq("id", numericId)
+    : lookup.eq("value", id)
+  ).maybeSingle<{ id: unknown }>();
 
-  if (!doc) {
+  if (!existing) {
     return NextResponse.json({ error: "not_found", message: "Option not found." }, { status: 404 });
   }
+
+  const { data, error } = await supabase
+    .from("dropdown_options")
+    .update(dropdownFieldsToRow({ active: Boolean(body.active) }))
+    .eq("id", Number(existing.id))
+    .select("*")
+    .single<Row>();
+  if (error) throw new DatabaseError(error);
+
+  const doc = mapDropdownRow(data);
 
   await writeAuditLog({
     actorId: user.id,
@@ -211,7 +262,7 @@ export const PATCH = withApi(async (req: Request) => {
     actorEmail: user.email,
     action: "dropdown.toggle",
     entity: "DropdownOption",
-    entityId: String(doc._id),
+    entityId: doc.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
     meta: { active: Boolean(body.active), label: doc.label },
@@ -232,12 +283,12 @@ export const PUT = withApi(async (req: Request) => {
     throw new ApiInputError("An ordered list of option ids is required.");
   }
 
-  await connectDB();
-  const filter = body.type ? { type: body.type } : { _id: { $in: body.ids } };
+  const supabase = await connectDB();
+  const numericIds = body.ids.map((id) => Number(id)).filter((id) => Number.isFinite(id));
 
   await Promise.all(
-    body.ids.map((id, index) =>
-      DropdownOption.updateOne({ _id: id, ...filter }, { $set: { order: index } }),
+    numericIds.map((id, index) =>
+      supabase.from("dropdown_options").update({ sort_order: index }).eq("id", id),
     ),
   );
 
@@ -252,8 +303,12 @@ export const PUT = withApi(async (req: Request) => {
     meta: { type: body.type, count: body.ids.length },
   });
 
-  const rows = await DropdownOption.find(filter).sort({ order: 1 }).lean<Lean[]>();
-  return NextResponse.json({ options: rows.map(toDTO) });
+  let listQuery = supabase.from("dropdown_options").select("*");
+  if (body.type) listQuery = listQuery.eq("type", body.type);
+  const { data, error } = await listQuery.order("sort_order");
+  if (error) throw new DatabaseError(error);
+
+  return NextResponse.json({ options: ((data ?? []) as Row[]).map((row) => toDTO(mapDropdownRow(row))) });
 });
 
 export const DELETE = withApi(async (req: Request) => {
@@ -264,47 +319,44 @@ export const DELETE = withApi(async (req: Request) => {
   const id = url.searchParams.get("id");
   if (!id) throw new ApiInputError("An option id is required.");
 
-  await connectDB();
+  const supabase = await connectDB();
 
   // Same id-or-value convenience as PATCH.
-  const doc = await DropdownOption.findOne(
-    isObjectId(id) ? { _id: id } : { value: id },
-  ).lean<Lean>();
-  if (!doc) {
+  const numericId = parseId(id);
+  const lookup = supabase.from("dropdown_options").select("*");
+  const { data: found } = await (numericId !== null
+    ? lookup.eq("id", numericId)
+    : lookup.eq("value", id)
+  ).maybeSingle<Row>();
+
+  if (!found) {
     return NextResponse.json({ error: "not_found", message: "Option not found." }, { status: 404 });
   }
 
+  const doc = mapDropdownRow(found);
+
   // Ticket references are stored by value, so count matching tickets before
   // allowing a hard delete. Referenced options must be deactivated instead.
-  const type = String(doc.type);
-  const value = String(doc.value);
-  const fieldByType: Record<string, string> = {
-    department: "department",
-    requestType: "requestType",
-    typeOfConcern: "typeOfConcern",
-    mode: "mode",
-    servicesGroup: "servicesGroup",
-    site: "site",
-    status: "status",
-    priority: "priority.value",
-  };
+  const column = TICKET_FIELD_BY_TYPE[doc.type] ?? doc.type;
+  const { count: usageCount } = await supabase
+    .from("tickets")
+    .select("id", { count: "exact", head: true })
+    .eq(column, doc.value);
 
-  const usageCount = await Ticket.countDocuments({
-    [fieldByType[type] ?? type]: value,
-  });
-
-  if (usageCount > 0) {
+  if ((usageCount ?? 0) > 0) {
+    const count = usageCount ?? 0;
     return NextResponse.json(
       {
         error: "in_use",
-        message: `${usageCount} ticket${usageCount === 1 ? "" : "s"} use "${doc.label}". Deactivate it instead so existing tickets keep their value.`,
-        usageCount,
+        message: `${count} ticket${count === 1 ? "" : "s"} use "${doc.label}". Deactivate it instead so existing tickets keep their value.`,
+        usageCount: count,
       },
       { status: 409 },
     );
   }
 
-  await DropdownOption.deleteOne({ _id: id });
+  const { error } = await supabase.from("dropdown_options").delete().eq("id", Number(doc.id));
+  if (error) throw new DatabaseError(error);
 
   await writeAuditLog({
     actorId: user.id,
@@ -312,10 +364,10 @@ export const DELETE = withApi(async (req: Request) => {
     actorEmail: user.email,
     action: "dropdown.delete",
     entity: "DropdownOption",
-    entityId: id,
+    entityId: doc.id,
     ip: clientIp(req),
     userAgent: userAgent(req),
-    meta: { type, label: doc.label },
+    meta: { type: doc.type, label: doc.label },
   });
 
   return NextResponse.json({ ok: true });

@@ -1,5 +1,6 @@
 import "server-only";
-import { connectDB, DB_NAME } from "../db/mongoose";
+import { connectDB, DB_NAME, unwrap } from "../db/supabase";
+import { mapSettingsRow, settingsFieldsToRow } from "../db/mappers";
 import type { PermissionSet } from "../shared/permissions";
 import { normalizePermissions } from "../shared/permissions";
 
@@ -8,7 +9,7 @@ const SETTINGS_ID = "singleton";
 /**
  * Settings are read on nearly every request (rate limits, numbering, SLA), so
  * they are cached in-process for a few seconds. The TTL is deliberately short
- * so a Super Admin edit propagates almost immediately without hammering Mongo
+ * so a SuperAdmin edit propagates almost immediately without hitting Postgres
  * on every API call, and without needing a redeploy.
  */
 const CACHE_TTL_MS = 3000;
@@ -94,7 +95,7 @@ export const FALLBACK_SETTINGS: SettingsShape = {
 
 /**
  * Environment acts as the default source of truth; the singleton document
- * overrides it once Super Admin saves. That keeps a fresh deployment working
+ * overrides it once SuperAdmin saves. That keeps a fresh deployment working
  * from `.env` alone while still allowing runtime edits.
  */
 function envSettings(): Partial<SettingsShape> {
@@ -126,8 +127,8 @@ export function normalizeSettings(raw: Record<string, unknown> | null): Settings
   const bool = (v: unknown, fallback: boolean) =>
     typeof v === "boolean" ? v : fallback;
 
-  // slaDefaults is a Map in Mongoose and a plain object from the raw driver.
-  let slaDefaults: Record<string, number> = {};
+  // slaDefaults is a free-form object (priority -> hours) stored as JSONB.
+  const slaDefaults: Record<string, number> = {};
   const rawSla = raw.slaDefaults;
   if (rawSla instanceof Map) {
     for (const [k, v] of rawSla) slaDefaults[String(k)] = Number(v);
@@ -188,7 +189,7 @@ export function normalizeSettings(raw: Record<string, unknown> | null): Settings
 
   // Environment supplies the *default*; a value saved in Configuration wins.
   // `pickSaved` keeps the stored value when it was explicitly set (non-empty)
-  // and falls back to env otherwise - so a Super Admin can override .env.local
+  // and falls back to env otherwise - so a SuperAdmin can override .env.local
   // from the UI, which is what the screen promises.
   const env = envSettings();
   const pickSaved = (saved: string, key: keyof typeof env): string => {
@@ -223,10 +224,18 @@ export async function getSettings(): Promise<SettingsShape> {
   if (cached && cached.expiresAt > now) return cached.value;
 
   try {
-    await connectDB();
-    const { SystemSetting } = await import("../models/system-setting");
-    const doc = await SystemSetting.findById(SETTINGS_ID).lean<Record<string, unknown>>();
-    const value = normalizeSettings((doc as Record<string, unknown>) ?? null);
+    const supabase = await connectDB();
+    const { data } = await supabase
+      .from("app_settings")
+      .select("*")
+      .eq("id", SETTINGS_ID)
+      .maybeSingle();
+
+    // `app_settings` stores app fields in snake_case columns; the mapper
+    // turns them back into the camelCase shape `normalizeSettings` expects.
+    const value = normalizeSettings(
+      data ? mapSettingsRow(data as Record<string, unknown>) : null,
+    );
     globalCache.__itTicketingSettings = { value, expiresAt: now + CACHE_TTL_MS };
     return value;
   } catch {
@@ -236,17 +245,23 @@ export async function getSettings(): Promise<SettingsShape> {
   }
 }
 
-/** Writes the singleton. Only Super Admin reaches this. */
+/** Writes the singleton. Only SuperAdmin reaches this. */
 export async function saveSettings(patch: Record<string, unknown>): Promise<SettingsShape> {
-  await connectDB();
-  const { SystemSetting } = await import("../models/system-setting");
-  const doc = await SystemSetting.findOneAndUpdate(
-    { _id: SETTINGS_ID },
-    { $set: patch },
-    { upsert: true, new: true, setDefaultsOnInsert: true },
-  ).lean<Record<string, unknown>>();
+  const supabase = await connectDB();
+  const row = settingsFieldsToRow(patch);
 
-  const value = normalizeSettings((doc as Record<string, unknown>) ?? null);
+  const data = unwrap(
+    await supabase
+      .from("app_settings")
+      .upsert(
+        { id: SETTINGS_ID, ...row, updated_at: new Date().toISOString() },
+        { onConflict: "id" },
+      )
+      .select("*")
+      .single<Record<string, unknown>>(),
+  );
+
+  const value = normalizeSettings(mapSettingsRow(data));
   globalCache.__itTicketingSettings = { value, expiresAt: Date.now() + CACHE_TTL_MS };
   return value;
 }

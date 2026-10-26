@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import * as React from "react";
 import Link from "next/link";
@@ -14,7 +14,7 @@ import {
   PrimaryButton,
   AlertBanner,
 } from "@/components/app-shell";
-import { Download, Plus, X, Trash2, ChevronUp, ChevronDown } from "lucide-react";
+import { Download, Plus, X, Trash2, ArrowUpDown } from "lucide-react";
 import { api, downloadCsv } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
 import type { DropdownOption, Ticket, TicketListResponse } from "@/lib/client/types";
@@ -758,11 +758,7 @@ function Th({
       >
         <span className="inline-flex items-center gap-1">
           {children}
-          {isActive ? (
-            <ChevronDown className="h-3 w-3" />
-          ) : (
-            <ChevronUp className="h-3 w-3 opacity-30" />
-          )}
+          <ArrowUpDown className={cn("h-3 w-3", isActive ? "" : "opacity-30")} />
         </span>
       </th>
     );

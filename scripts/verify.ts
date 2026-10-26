@@ -1,28 +1,16 @@
-/**
+﻿/**
  * Verifies the acceptance criteria that can be checked without a browser.
  *
  * Run: npx tsx --conditions react-server scripts/verify.ts
  *
  * Deliberately reads the real database rather than asserting on constants, so
- * it fails loudly if an index or a numbering rule regresses.
+ * it fails loudly if the seed data, the numbering rule or the atomic sequence
+ * regresses.
  */
 
 import "./load-env";
 
-import { connectDB } from "../src/lib/db/mongoose";
-import {
-  User,
-  Requestor,
-  Role,
-  Ticket,
-  TicketCounter,
-  DropdownOption,
-  SystemSetting,
-  EmailMessage,
-  AuditLog,
-  RateLimit,
-  ensureIndexes,
-} from "../src/lib/models";
+import { connectDB } from "../src/lib/db/supabase";
 import { renderTicketNumber, extractTicketNumber, hasSequenceToken } from "../src/lib/server/ticket-number";
 import { getSettings } from "../src/lib/server/settings";
 import { sanitizeHtml, htmlToText, normalizeInboundBody } from "../src/lib/server/sanitize";
@@ -47,87 +35,52 @@ function section(title: string) {
 
 async function main() {
   console.log("Verifying IT Ticketing acceptance criteria\n");
-  await connectDB();
+  const supabase = await connectDB();
 
-  // ── 1. Collections + indexes ─────────────────────────────────────────────
-  section("1. Collections and indexes");
-  await ensureIndexes();
+  const countOf = async (table: string) => {
+    const { count } = await supabase.from(table).select("*", { count: "exact", head: true });
+    return count ?? 0;
+  };
 
-  const expectations: Array<{
-    collection: string;
-    required: string[];
-  }> = [
-    { collection: "tickets", required: ["ticketNumber_1"] },
-    { collection: "email_messages", required: ["messageId_1"] },
-    { collection: "users", required: ["email_1"] },
-    { collection: "requestors", required: ["employeeId_1", "fullName_1"] },
-    { collection: "ticket_counters", required: ["dateKey_1"] },
-    { collection: "dropdown_options", required: ["type_1_label_1", "type_1_value_1"] },
-    { collection: "roles", required: ["name_1"] },
-    { collection: "rate_limits", required: ["key_1_windowStart_1", "windowStart_1"] },
+  // ── 1. Tables reachable ──────────────────────────────────────────────────
+  section("1. Tables");
+  const tables = [
+    "roles",
+    "requestors",
+    "dropdown_options",
+    "app_settings",
+    "email_messages",
+    "system_audit_logs",
+    "rate_limits",
+    "ticket_counters",
+    "users",
+    "tickets",
   ];
-
-  for (const { collection, required } of expectations) {
-    const model: Record<string, { collection: { listIndexes(): { toArray(): Promise<Array<{ name: string }>> } } } | undefined> = {
-      tickets: Ticket,
-      email_messages: EmailMessage,
-      users: User,
-      requestors: Requestor,
-      ticket_counters: TicketCounter,
-      dropdown_options: DropdownOption,
-      roles: Role,
-      rate_limits: RateLimit,
-    };
-
-    const handle = model[collection];
-    if (!handle) {
-      check(`${collection}: index check`, false, "model not registered");
-      continue;
-    }
-    const indexes = await handle.collection.listIndexes().toArray();
-    const indexNames = indexes.map((index) => index.name);
-    for (const name of required) {
-      check(`${collection}.${name}`, indexNames.includes(name), indexNames.join(", "));
-    }
+  for (const table of tables) {
+    const { error } = await supabase.from(table).select("*", { count: "exact", head: true });
+    check(`${table} readable`, !error, error?.message ?? "");
   }
-
-  // Unique-ness, not just presence.
-  const ticketIndex = (await Ticket.collection.listIndexes().toArray()).find(
-    (i) => i.name === "ticketNumber_1",
-  );
-  check("tickets.ticketNumber is UNIQUE", ticketIndex?.unique === true);
-
-  const messageIndex = (await EmailMessage.collection.listIndexes().toArray()).find(
-    (i) => i.name === "messageId_1",
-  );
-  check("email_messages.messageId is UNIQUE", messageIndex?.unique === true);
-
-  const compound = (await Ticket.collection.listIndexes().toArray()).find(
-    (i) => i.name === "status_1_technician_1_dateCreated_-1",
-  );
-  check(
-    "tickets compound status+technician+dateCreated",
-    Boolean(compound),
-    (await Ticket.collection.listIndexes().toArray()).map((i) => i.name).join(", "),
-  );
-
-  const ttl = (await RateLimit.collection.listIndexes().toArray()).find(
-    (i) => i.name === "windowStart_1",
-  );
-  check("rate_limits TTL self-prunes windows", typeof ttl?.expireAfterSeconds === "number");
-
-  // The seeded singleton must exist, not merely fall back to defaults.
-  check("settings singleton persisted", (await SystemSetting.countDocuments()) >= 1);
 
   // ── 2. Seed data ─────────────────────────────────────────────────────────
   section("2. Seeded configuration");
-  check("4 system roles", (await Role.countDocuments({ isSystem: true })) >= 4);
-  check("a super admin exists", (await User.countDocuments({ status: "active" })) >= 1);
+  const { count: roleCount } = await supabase
+    .from("roles")
+    .select("*", { count: "exact", head: true })
+    .eq("is_system", true);
+  check("4 system roles", (roleCount ?? 0) >= 4, String(roleCount));
 
-  const dropdownCounts = await DropdownOption.aggregate<{ _id: string; count: number }>([
-    { $group: { _id: "$type", count: { $sum: 1 } } },
-  ]);
-  const byType = new Map(dropdownCounts.map((row) => [row._id, row.count]));
+  const { count: adminCount } = await supabase
+    .from("users")
+    .select("*", { count: "exact", head: true })
+    .eq("Status", "active");
+  check("an active account exists", (adminCount ?? 0) >= 1, String(adminCount));
+
+  const { data: dropdownRows } = await supabase.from("dropdown_options").select("type, sla_hours");
+  const byType = new Map<string, number>();
+  for (const row of dropdownRows ?? []) {
+    const type = String((row as Record<string, unknown>).type);
+    byType.set(type, (byType.get(type) ?? 0) + 1);
+  }
   const expectedCounts: Record<string, number> = {
     department: 14,
     requestType: 6,
@@ -142,9 +95,18 @@ async function main() {
     check(`${type} options seeded`, byType.get(type) === count, `got ${byType.get(type)}, want ${count}`);
   }
 
+  const { data: priorityRows } = await supabase
+    .from("dropdown_options")
+    .select("value, sla_hours")
+    .eq("type", "priority");
+  check(
+    "every priority option carries an SLA budget",
+    (priorityRows ?? []).length > 0 &&
+      (priorityRows ?? []).every((row) => (row as Record<string, unknown>).sla_hours !== null),
+  );
+
   const settings = await getSettings();
   check("settings singleton readable", settings.ticketPrefix.length > 0);
-  check("priority SLA hours configured", (Object.keys(settings.slaDefaults).length >= 0));
 
   // ── 3. Ticket numbering ──────────────────────────────────────────────────
   section("3. Ticket number pattern");
@@ -184,27 +146,38 @@ async function main() {
 
   check("counter key is the Manila date", /^\d{4}-\d{2}-\d{2}$/.test(appDateKey()));
 
-  // Parallel reservation must not hand out the same number twice.
+  // ── 4. Atomic sequence under parallel creates ────────────────────────────
   section("4. Atomic sequence under parallel creates");
   const dateKey = appDateKey();
-  const before = (await TicketCounter.findOne({ dateKey }).lean<{ seq?: number }>())?.seq ?? 0;
+  const { data: beforeRow } = await supabase
+    .from("ticket_counters")
+    .select("seq")
+    .eq("date_key", dateKey)
+    .maybeSingle<Record<string, unknown>>();
+  const before = Number(beforeRow?.seq ?? 0);
 
-  const results = await Promise.all(
-    Array.from({ length: 50 }, async () => {
-      await TicketCounter.findOneAndUpdate(
-        { dateKey },
-        { $inc: { seq: 1 }, $setOnInsert: { dateKey } },
-        { upsert: true, new: true },
-      ).lean<{ seq: number }>();
-    }),
+  const reservations = await Promise.all(
+    Array.from({ length: 50 }, () =>
+      supabase.rpc("next_ticket_seq", { p_date_key: dateKey }),
+    ),
   );
-  void results;
+  const seqs = reservations.map((r) => Number(r.data ?? 0));
+  check("50 parallel reservations returned 50 distinct numbers", new Set(seqs).size === 50);
 
-  const after = (await TicketCounter.findOne({ dateKey }).lean<{ seq?: number }>())?.seq ?? 0;
-  check("50 parallel $inc produced 50 distinct increments", after === before + 50, `${before} -> ${after}`);
+  const { data: afterRow } = await supabase
+    .from("ticket_counters")
+    .select("seq")
+    .eq("date_key", dateKey)
+    .maybeSingle<Record<string, unknown>>();
+  const after = Number(afterRow?.seq ?? 0);
+  check("counter advanced by exactly 50", after === before + 50, `${before} -> ${after}`);
 
   // Roll the test counter back so verification leaves no residue.
-  await TicketCounter.updateOne({ dateKey }, { $set: { seq: before } });
+  if (before === 0) {
+    await supabase.from("ticket_counters").delete().eq("date_key", dateKey);
+  } else {
+    await supabase.from("ticket_counters").update({ seq: before }).eq("date_key", dateKey);
+  }
 
   // ── 5. Sanitisation ──────────────────────────────────────────────────────
   section("5. Inbound HTML sanitisation");
@@ -223,43 +196,37 @@ async function main() {
 
   // ── 6. Data integrity ────────────────────────────────────────────────────
   section("6. Stored data integrity");
-  const noNumber = await Ticket.countDocuments({ $or: [{ ticketNumber: { $exists: false } }, { ticketNumber: "" }] });
-  check("every ticket has a number", noNumber === 0, `${noNumber} missing`);
+  const { count: noNumber } = await supabase
+    .from("tickets")
+    .select("*", { count: "exact", head: true })
+    .or("ticket_id.is.null,ticket_id.eq.");
+  check("every ticket has a number", (noNumber ?? 0) === 0, `${noNumber} missing`);
 
-  const dupes = await Ticket.aggregate<{ _id: string; count: number }>([
-    { $group: { _id: "$ticketNumber", count: { $sum: 1 } } },
-    { $match: { count: { $gt: 1 } } },
-  ]);
-  check("no duplicate ticket numbers", dupes.length === 0, JSON.stringify(dupes));
+  const { data: numberRows } = await supabase.from("tickets").select("ticket_id");
+  const numbers = (numberRows ?? []).map((row) => String((row as Record<string, unknown>).ticket_id ?? ""));
+  const dupes = numbers.filter((value, index) => value && numbers.indexOf(value) !== index);
+  check("no duplicate ticket numbers", dupes.length === 0, JSON.stringify([...new Set(dupes)]));
 
-  const orphanRemarks = await Ticket.countDocuments({ "remarks.authorName": { $exists: false } });
-  check("every ticket has at least one remark author", orphanRemarks === 0, `${orphanRemarks} bad`);
-
-  const badPriority = await Ticket.countDocuments({ "priority.slaHours": { $exists: false } });
-  check("every ticket has priority SLA hours", badPriority === 0, `${badPriority} missing`);
-
-  const openTickets = await Ticket.countDocuments({ status: { $nin: ["resolved", "closed", "cancelled"] } });
-  const missingSla = await Ticket.countDocuments({
-    status: { $nin: ["resolved", "closed", "cancelled"] },
-    $or: [{ slaDueAt: null }, { slaDueAt: { $exists: false } }],
-  });
+  const { count: openTickets } = await supabase
+    .from("tickets")
+    .select("*", { count: "exact", head: true })
+    .not("status", "in", "(resolved,closed,cancelled)");
+  const { count: missingSla } = await supabase
+    .from("tickets")
+    .select("*", { count: "exact", head: true })
+    .not("status", "in", "(resolved,closed,cancelled)")
+    .is("sla_due_at", null);
   check(
     "open tickets have an SLA deadline",
-    openTickets === 0 || missingSla === 0,
-    `${missingSla} of ${openTickets} open tickets lack slaDueAt`,
+    (openTickets ?? 0) === 0 || (missingSla ?? 0) === 0,
+    `${missingSla} of ${openTickets} open tickets lack sla_due_at`,
   );
 
   // ── 7. Counts ────────────────────────────────────────────────────────────
   section("7. Current contents");
-  console.log(`   tickets           ${await Ticket.countDocuments()}`);
-  console.log(`   users             ${await User.countDocuments()}`);
-  console.log(`   requestors        ${await Requestor.countDocuments()}`);
-  console.log(`   roles             ${await Role.countDocuments()}`);
-  console.log(`   dropdown options  ${await DropdownOption.countDocuments()}`);
-  console.log(`   ticket counters   ${await TicketCounter.countDocuments()}`);
-  console.log(`   audit logs        ${await AuditLog.countDocuments()}`);
-  console.log(`   email messages    ${await EmailMessage.countDocuments()}`);
-  void SystemSetting;
+  for (const table of tables) {
+    console.log(`   ${table.padEnd(17)} ${await countOf(table)}`);
+  }
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);

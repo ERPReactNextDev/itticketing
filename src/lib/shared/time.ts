@@ -1,4 +1,4 @@
-import { APP_TIMEZONE } from "./constants";
+﻿import { APP_TIMEZONE } from "./constants";
 
 /**
  * Asia/Manila is permanently UTC+8 and has never observed DST, so a fixed

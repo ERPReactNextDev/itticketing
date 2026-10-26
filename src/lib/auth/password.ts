@@ -1,4 +1,4 @@
-import "server-only";
+﻿import "server-only";
 import { compare, hash } from "bcrypt";
 
 const SALT_ROUNDS = 12;

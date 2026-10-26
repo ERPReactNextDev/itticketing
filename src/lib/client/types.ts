@@ -1,4 +1,4 @@
-/** Client-side view models shared across pages. */
+﻿/** Client-side view models shared across pages. */
 
 export type PermissionKey =
   | "manageUsers"

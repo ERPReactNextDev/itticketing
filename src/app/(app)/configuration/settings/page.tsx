@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import * as React from "react";
 import { AppPage } from "@/components/app-page";
@@ -150,18 +150,6 @@ export default function SettingsConfigPage() {
       ),
     );
   }, [form?.ticketNumberPattern, form?.ticketPrefix, form?.seqPadLength, preview]);
-
-  function buildParts() {
-    const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
-    const nextSeq = preview ? Number(preview.current.split(/[-/]/).pop() ?? "0") + 1 : 1;
-    return {
-      year: String(now.getUTCFullYear()),
-      year2: String(now.getUTCFullYear()).slice(-2),
-      month: String(now.getUTCMonth() + 1).padStart(2, "0"),
-      day: String(now.getUTCDate()).padStart(2, "0"),
-      nextSeq: Number.isFinite(nextSeq) ? nextSeq : 1,
-    };
-  }
 
   async function save() {
     if (!form) return;

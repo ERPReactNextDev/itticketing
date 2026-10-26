@@ -1,6 +1,6 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
-import { Requestor, buildFullName } from "@/lib/models";
+﻿import { NextResponse } from "next/server";
+import { connectDB, DatabaseError, UNIQUE_VIOLATION, type SupabaseClient } from "@/lib/db/supabase";
+import { buildFullName, requestorFieldsToRow } from "@/lib/db/mappers";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { writeAuditLog } from "@/lib/server/audit";
 import { clientIp, userAgent } from "@/lib/server/rate-limit";
@@ -25,6 +25,33 @@ type ImportReport = {
   skipped: number;
   errors: Array<{ row: number; employeeId: string; message: string }>;
 };
+
+/**
+ * Inserts requestor rows, degrading to one-at-a-time on a unique collision.
+ *
+ * The directory has two unique keys (`employee_id` and lower-cased `email`), so
+ * a single clashing row would otherwise abort the whole batch. The retry keeps
+ * a 900-row import resilient while the common case still uses one statement.
+ */
+async function insertRequestors(
+  supabase: SupabaseClient,
+  rows: Array<Record<string, unknown>>,
+  report: ImportReport,
+): Promise<void> {
+  const { data, error } = await supabase.from("requestors").insert(rows).select("id");
+  if (!error) {
+    report.created += data?.length ?? rows.length;
+    return;
+  }
+  if (error.code !== UNIQUE_VIOLATION) throw new DatabaseError(error);
+
+  for (const row of rows) {
+    const { error: rowError } = await supabase.from("requestors").insert(row);
+    if (!rowError) report.created += 1;
+    else if (rowError.code === UNIQUE_VIOLATION) report.skipped += 1;
+    else throw new DatabaseError(rowError);
+  }
+}
 
 /**
  * CSV import for the requestor directory.
@@ -55,7 +82,7 @@ export const POST = withApi(async (req: Request) => {
     );
   }
 
-  await connectDB();
+  const supabase = await connectDB();
 
   const report: ImportReport = { created: 0, updated: 0, skipped: 0, errors: [] };
   const operations: Array<Record<string, unknown>> = [];
@@ -104,66 +131,47 @@ export const POST = withApi(async (req: Request) => {
     });
   });
 
-  const employeeIds = operations.map((op) => op.employeeId as string);
-  const existing = await Requestor.find({ employeeId: { $in: employeeIds } })
-    .select("employeeId")
-    .lean<Array<{ employeeId: string }>>();
-  const existingIds = new Set(existing.map((doc) => doc.employeeId));
+  const employeeIds = operations.map((op) => String(op.employeeId));
+  const { data: existing } = await supabase
+    .from("requestors")
+    .select("employee_id")
+    .in("employee_id", employeeIds);
+  const existingIds = new Set(
+    ((existing ?? []) as Array<{ employee_id: string }>).map((doc) => doc.employee_id),
+  );
 
   const toInsert: Array<Record<string, unknown>> = [];
   const toUpdate: Array<Record<string, unknown>> = [];
+  const seenIds = new Set<string>();
 
   for (const op of operations) {
-    if (existingIds.has(op.employeeId as string)) {
-      if (body.updateExisting) {
-        toUpdate.push(op);
-      } else {
-        report.skipped += 1;
-      }
+    const employeeId = String(op.employeeId);
+    if (existingIds.has(employeeId)) {
+      if (body.updateExisting) toUpdate.push(op);
+      else report.skipped += 1;
       continue;
     }
-    toInsert.push({ ...op, createdBy: user.id });
+    // The same file can list an employeeId twice; keep the first and skip the
+    // rest so a duplicate cannot abort the batch.
+    if (seenIds.has(employeeId)) {
+      report.skipped += 1;
+      continue;
+    }
+    seenIds.add(employeeId);
+    toInsert.push(op);
   }
 
   if (toInsert.length > 0) {
-    // ordered:false keeps the import resilient when the same file lists a
-    // duplicate employeeId twice - the second is skipped, not an error.
-    await Requestor.insertMany(toInsert, { ordered: false }).catch((error: unknown) => {
-      // Bulk write errors are per-document; surface the duplicate-key count.
-      const writeErrors = (error as { writeErrors?: unknown[] })?.writeErrors ?? [];
-      const duplicates = writeErrors.filter(
-        (we) => (we as { code?: number })?.code === 11000,
-      ).length;
-      if (duplicates > 0) {
-        report.skipped += duplicates;
-        const inserted = toInsert.length - duplicates;
-        report.created += inserted;
-        return;
-      }
-      throw error;
-    });
-    if (report.created === 0 && toInsert.length > 0) {
-      report.created += toInsert.length;
-    }
+    const insertRows = toInsert.map((op) => requestorFieldsToRow({ ...op, createdBy: user.id }));
+    await insertRequestors(supabase, insertRows, report);
   }
 
   for (const op of toUpdate) {
-    await Requestor.updateOne(
-      { employeeId: op.employeeId },
-      {
-        $set: {
-          firstName: op.firstName,
-          lastName: op.lastName,
-          fullName: op.fullName,
-          email: op.email,
-          department: op.department,
-          site: op.site,
-          phone: op.phone,
-          status: op.status,
-          notes: op.notes,
-        },
-      },
-    );
+    const { error } = await supabase
+      .from("requestors")
+      .update(requestorFieldsToRow(op))
+      .eq("employee_id", String(op.employeeId));
+    if (error) throw new DatabaseError(error);
     report.updated += 1;
   }
 

@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import * as React from "react";
 import { AppPage } from "@/components/app-page";
@@ -198,7 +198,7 @@ export default function RolesConfigPage() {
 
         <AlertBanner tone="info" title="How the matrix is enforced">
           Every API route re-checks permissions server-side, so hiding a menu item is only cosmetic —
-          the check that matters is in the route handler. Super Admin must keep Manage Roles and
+          the check that matters is in the route handler. SuperAdmin must keep Manage Roles and
           Manage Settings, otherwise the system could become permanently unadministrable.
         </AlertBanner>
       </div>

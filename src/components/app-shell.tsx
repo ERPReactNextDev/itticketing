@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import * as React from "react";
 import Link from "next/link";
@@ -58,7 +58,7 @@ type NavSection = {
  * Sidebar structure.
  *
  * Groups mirror the product's mental model: what you work on (Workspace), who
- * you work for (Directory), and how the system is configured (Super Admin).
+ * you work for (Directory), and how the system is configured (SuperAdmin).
  */
 const NAV_SECTIONS: NavSection[] = [
   {
@@ -77,7 +77,7 @@ const NAV_SECTIONS: NavSection[] = [
     ],
   },
   {
-    title: "Super Admin",
+    title: "SuperAdmin",
     items: [
       { label: "Configuration", href: "/configuration/dropdowns", icon: SlidersHorizontal, permissions: ["manageDropdowns", "manageSettings"] },
       { label: "Roles & Access", href: "/configuration/roles", icon: ShieldCheck, permissions: ["manageRoles"] },

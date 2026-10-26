@@ -1,40 +1,48 @@
 import "server-only";
-import { connectDB } from "../db/mongoose";
-import { AuditLog } from "../models";
+import { connectDB } from "../db/supabase";
 
 export type AuditInput = {
   actorId?: string | null;
-  actorName?: string;
-  actorEmail?: string;
+  /** Display name captured at write time, so the trail stays readable. */
+  actorName?: string | null;
+  actorEmail?: string | null;
   action: string;
-  entity: string;
+  /** Domain object the action touched, e.g. "User", "Ticket". */
+  entity?: string | null;
   entityId?: string | null;
-  ip?: string;
-  userAgent?: string;
-  meta?: Record<string, unknown>;
+  ip?: string | null;
+  userAgent?: string | null;
+  meta?: Record<string, unknown> | null;
 };
 
 /**
- * Appends an audit entry.
+ * Writes to `system_audit_logs`.
  *
- * Deliberately never throws: auditing must not be able to fail the operation it
- * is recording, or a Mongo hiccup would roll back a legitimate user action.
+ * This is fire-and-forget: we don't await it in the main request flow so audit
+ * logging never slows down the UI or blocks a response, even if the store is
+ * slow.
  */
-export async function writeAuditLog(input: AuditInput): Promise<void> {
-  try {
-    await connectDB();
-    await AuditLog.create({
-      actor: input.actorId ?? null,
-      actorName: input.actorName ?? (input.actorId ? "" : "system"),
-      actorEmail: input.actorEmail ?? "",
-      action: input.action,
-      entity: input.entity,
-      entityId: input.entityId ?? "",
-      ip: input.ip ?? "",
-      userAgent: input.userAgent ?? "",
-      meta: input.meta ?? {},
-    });
-  } catch (error) {
-    console.error("[audit] failed to write audit log:", error);
-  }
+export function writeAuditLog(input: AuditInput): void {
+  // We don't await this promise.
+  (async () => {
+    try {
+      const supabase = await connectDB();
+      const { error } = await supabase.from("system_audit_logs").insert({
+        actor_id: input.actorId ?? null,
+        // The column is NOT NULL with a "system" default, but an explicit
+        // blank would defeat it, so fall back here.
+        actor_name: input.actorName?.trim() || "system",
+        actor_email: input.actorEmail ?? "",
+        action: input.action,
+        entity: input.entity ?? "",
+        entity_id: input.entityId ?? "",
+        ip: input.ip ?? "",
+        user_agent: input.userAgent ?? "",
+        meta: input.meta ?? {},
+      });
+      if (error) throw error;
+    } catch (error) {
+      console.error("[audit] failed to write audit log:", error);
+    }
+  })();
 }

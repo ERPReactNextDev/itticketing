@@ -1,5 +1,4 @@
-import { NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongoose";
+﻿import { NextResponse } from "next/server";
 import { requireUser, requirePermission } from "@/lib/auth/session";
 import { queryTickets, type TicketListQuery } from "@/lib/server/ticket-query";
 import { createTicket, TicketValidationError } from "@/lib/server/tickets";
@@ -7,7 +6,7 @@ import { reserveTicketNumber } from "@/lib/server/ticket-number";
 import { ticketCreateRule, enforce, clientIp, userAgent } from "@/lib/server/rate-limit";
 import { writeAuditLog } from "@/lib/server/audit";
 import { withApi, readJson, intParam, boolParam, csvParam } from "@/lib/server/http";
-import { storeBuffer } from "@/lib/server/gridfs";
+import { storeBuffer } from "@/lib/server/storage";
 
 export const dynamic = "force-dynamic";
 
@@ -60,7 +59,7 @@ type CreateBody = {
   scheduledDate?: string | null;
   remarks?: string;
   source?: "manual" | "email" | "webform";
-  /** base64 payloads, uploaded to GridFS before the ticket is created. */
+  /** base64 payloads, uploaded to Supabase Storage before the ticket is created. */
   attachments?: Array<{ filename: string; contentType: string; content: string }>;
 };
 
@@ -72,8 +71,6 @@ export const POST = withApi(async (req: Request) => {
 
   const limited = await enforce(await ticketCreateRule(req, user.id));
   if (limited) return limited;
-
-  await connectDB();
 
   // Store attachments first so the ticket never references a partial upload.
   const storedIds: string[] = [];
