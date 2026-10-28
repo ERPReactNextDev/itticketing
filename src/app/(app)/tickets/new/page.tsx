@@ -12,7 +12,8 @@ import {
   GhostButton,
 } from "@/components/app-shell";
 import { LabeledField, Select, TextInput, TextArea, AutoField, ACCENT } from "@/components/ui/primitives";
-import { ArrowLeft, Save, Search, UserPlus, X } from "lucide-react";
+import { DateTimePicker } from "@/components/ui/date-time-picker";
+import { ArrowLeft, Save, Search, UserPlus, Clock, X } from "lucide-react";
 import { api } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
 import type { DropdownOption, Requestor, Ticket } from "@/lib/client/types";
@@ -44,7 +45,10 @@ export default function NewTicketPage() {
     site: "",
     priority: "",
     status: "",
+    /** ISO string when set, empty string when unset */
     scheduledDate: "",
+    supportStartTime: "",
+    supportEndTime: "",
     remarks: "",
   });
 
@@ -110,9 +114,9 @@ export default function NewTicketPage() {
         site: form.site || undefined,
         priority: form.priority || undefined,
         status: form.status || undefined,
-        scheduledDate: form.scheduledDate
-          ? (fromDateInputValue(form.scheduledDate)?.toISOString() ?? null)
-          : null,
+        scheduledDate: form.scheduledDate ? form.scheduledDate : null,
+        supportStartTime: form.supportStartTime || null,
+        supportEndTime: form.supportEndTime || null,
         remarks: form.remarks,
         source: "manual",
       });
@@ -193,17 +197,6 @@ export default function NewTicketPage() {
                 </LabeledField>
               </div>
 
-              <div className="sm:col-span-2">
-                <LabeledField label="Description" hint="optional">
-                  <TextArea
-                    rows={5}
-                    value={form.description}
-                    onChange={(event) => set("description", event.target.value)}
-                    placeholder="Describe the problem, the impact, and anything already tried."
-                  />
-                </LabeledField>
-              </div>
-
               <LabeledField label="Department">
                 <OptionSelect
                   type="department"
@@ -271,14 +264,78 @@ export default function NewTicketPage() {
                 />
               </LabeledField>
 
-              {form.status === "scheduled" ? (
-                <LabeledField label="Scheduled Date" hint="pauses the SLA clock">
-                  <TextInput
-                    type="date"
-                    value={form.scheduledDate}
-                    onChange={(event) => set("scheduledDate", event.target.value)}
+              {/* Scheduled Date — hidden when status is resolved/closed/cancelled (support times replace it) */}
+              {!["resolved", "closed", "cancelled"].includes(form.status) ? (
+                <LabeledField
+                  label="Scheduled Date"
+                  hint={form.status === "scheduled" ? "pauses the SLA clock" : "optional"}
+                >
+                  <DateTimePicker
+                    value={form.scheduledDate || undefined}
+                    onChange={(iso) => set("scheduledDate", iso ?? "")}
+                    placeholder="Pick date & time"
+                    fromDate={new Date()}
                   />
                 </LabeledField>
+              ) : null}
+
+              {/* Support time — only shown when status is resolved/closed/cancelled */}
+              {["resolved", "closed", "cancelled"].includes(form.status) ? (
+                <div className="flex flex-col gap-2">
+                  <LabeledField label="Start of Support">
+                    <DateTimePicker
+                      value={form.supportStartTime || undefined}
+                      onChange={(iso) => set("supportStartTime", iso ?? "")}
+                      placeholder="When support started"
+                    />
+                  </LabeledField>
+
+                  <LabeledField label="End of Support">
+                    <DateTimePicker
+                      value={form.supportEndTime || undefined}
+                      onChange={(iso) => set("supportEndTime", iso ?? "")}
+                      placeholder="When issue was resolved"
+                    />
+                  </LabeledField>
+                </div>
+              ) : null}
+
+              {/* Duration badge — spans both columns */}
+              {["resolved", "closed", "cancelled"].includes(form.status) ? (
+                <div className="sm:col-span-2">
+                  <div className="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2">
+                    <Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <span className="text-[11px] text-muted-foreground">Duration:</span>
+                    {(() => {
+                      if (!form.supportStartTime || !form.supportEndTime) {
+                        return (
+                          <span className="text-[11px] italic text-muted-foreground">
+                            Set both times to calculate
+                          </span>
+                        );
+                      }
+                      const diff =
+                        new Date(form.supportEndTime).getTime() -
+                        new Date(form.supportStartTime).getTime();
+                      if (diff <= 0) {
+                        return (
+                          <span className="text-[11px] text-red-500">
+                            End must be after start
+                          </span>
+                        );
+                      }
+                      const mins = Math.round(diff / 60000);
+                      const h = Math.floor(mins / 60);
+                      const m = mins % 60;
+                      const label = h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${mins} min`;
+                      return (
+                        <span className="font-mono text-[12px] font-bold text-foreground">
+                          {label}
+                        </span>
+                      );
+                    })()}
+                  </div>
+                </div>
               ) : null}
             </div>
           </Panel>

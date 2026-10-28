@@ -65,6 +65,8 @@ const TICKET_COLUMNS = [
   "date_created",
   "date_closed",
   "date_reopened",
+  "support_start_time",
+  "support_end_time",
   "sla_due_at",
   "sla_paused_total_seconds",
   "sla_paused_at",

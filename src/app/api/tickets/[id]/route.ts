@@ -38,6 +38,8 @@ type PatchBody = {
   priority?: string;
   status?: string;
   scheduledDate?: string | null;
+  supportStartTime?: string | null;
+  supportEndTime?: string | null;
   technician?: string | null;
   requestorId?: string | null;
   attachments?: string[];
@@ -47,7 +49,7 @@ type PatchBody = {
 
 /** Fields each permission unlocks on a single ticket. */
 function allowedFields(user: Awaited<ReturnType<typeof requireUser>>): Set<string> {
-  const allowed = new Set<string>(["subject", "description", "requestorId", "attachments"]);
+  const allowed = new Set<string>(["subject", "description", "requestorId", "attachments", "supportStartTime", "supportEndTime"]);
   if (user.permissions.changeStatus) allowed.add("status");
   if (user.permissions.assignTechnician) allowed.add("technician");
   if (user.permissions.closeTicket) allowed.add("priority");

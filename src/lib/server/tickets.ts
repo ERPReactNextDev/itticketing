@@ -42,6 +42,8 @@ export type CreateTicketInput = {
   priority?: string;
   status?: string;
   scheduledDate?: Date | null;
+  supportStartTime?: Date | null;
+  supportEndTime?: Date | null;
   attachments?: string[];
   source?: "manual" | "email" | "webform";
   emailThreadId?: string;
@@ -111,6 +113,8 @@ type MutableTicket = {
   priority: PriorityValue;
   [key: string]: unknown;
   scheduledDate: Date | null;
+  supportStartTime: Date | null;
+  supportEndTime: Date | null;
   requestor: string | null;
   technician: string | null;
   processedBy: string | null;
@@ -166,6 +170,8 @@ function rowToMutable(row: Record<string, unknown>): MutableTicket {
     status: str(row.status),
     priority,
     scheduledDate: toDate(row.date_scheduled),
+    supportStartTime: toDate(row.support_start_time),
+    supportEndTime: toDate(row.support_end_time),
     requestor: row.requestor_id ? str(row.requestor_id) : null,
     technician: row.technician_id ? str(row.technician_id) : null,
     processedBy: row.processed_by_id ? str(row.processed_by_id) : null,
@@ -225,6 +231,8 @@ function mutableToRow(doc: MutableTicket): Record<string, unknown> {
     sla_paused_at: isoOrNull(doc.slaPausedAt),
     sla_paused_total_seconds: doc.slaPausedTotalSeconds,
     date_scheduled: isoOrNull(doc.scheduledDate),
+    support_start_time: isoOrNull(doc.supportStartTime),
+    support_end_time: isoOrNull(doc.supportEndTime),
     attachments: doc.attachments,
     remarks_json: doc.remarks,
     status_history: doc.statusHistory,
@@ -403,6 +411,8 @@ export async function createTicket(
     closed_by_id: closed ? author.id : null,
 
     date_scheduled: input.scheduledDate ? input.scheduledDate.toISOString() : null,
+    support_start_time: input.supportStartTime ? input.supportStartTime.toISOString() : null,
+    support_end_time: input.supportEndTime ? input.supportEndTime.toISOString() : null,
     date_created: now.toISOString(),
     date_updated: now.toISOString(),
     date_closed: closed ? now.toISOString() : null,
@@ -669,6 +679,17 @@ export async function patchTicket(
         oldValue: currentIso,
         newValue: nextIso,
       });
+    }
+  }
+
+  // ── Support start / end time ─────────────────────────────────────────────
+  for (const key of ["supportStartTime", "supportEndTime"] as const) {
+    if (patch[key] === undefined) continue;
+    const nextValue = patch[key] ? new Date(patch[key] as string) : null;
+    const nextIso = nextValue && !Number.isNaN(nextValue.getTime()) ? nextValue.toISOString() : "";
+    const currentIso = doc[key] ? (doc[key] as Date).toISOString() : "";
+    if (nextIso !== currentIso) {
+      doc[key] = nextIso ? nextValue : null;
     }
   }
 

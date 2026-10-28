@@ -301,6 +301,8 @@ export function mapTicketRow(row: TicketRow, names?: NameMap): TicketDocForDTO {
     dateCreated: iso(row.date_created),
     dateClosed: iso(row.date_closed),
     dateReopened: iso(row.date_reopened),
+    supportStartTime: iso(row.support_start_time),
+    supportEndTime: iso(row.support_end_time),
 
     slaDueAt: iso(row.sla_due_at),
     slaPausedTotalSeconds: num(row.sla_paused_total_seconds, 0),

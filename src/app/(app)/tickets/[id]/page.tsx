@@ -37,12 +37,14 @@ import {
   Flag,
   FileText,
   StickyNote,
+  Clock,
   X,
 } from "lucide-react";
 import { api, ApiError } from "@/lib/client/api";
 import { useSession } from "@/contexts/SessionContext";
 import type { DropdownOption, Ticket, TicketRemark } from "@/lib/client/types";
 import { formatDateTime, formatDuration, timeAgo } from "@/lib/shared/format";
+import { DateTimePicker } from "@/components/ui/date-time-picker";
 
 const STATUS_COLORS: Record<string, string> = {
   pending: "#eab308",
@@ -690,11 +692,30 @@ export default function TicketDetailPage() {
                 <div className="grid grid-cols-2 gap-2 pt-1">
                   <KeyValueRow label="Created" value={formatDateTime(ticket.dateCreated)} />
                   <KeyValueRow label="Last Activity" value={timeAgo(ticket.lastActivityAt)} />
-                  <KeyValueRow label="Closed" value={ticket.dateClosed ? formatDateTime(ticket.dateClosed) : "—"} />
+                  <KeyValueRow
+                    label="Closed"
+                    value={
+                      ticket.dateClosed
+                        ? ["resolved", "closed", "cancelled"].includes(ticket.status)
+                          ? new Date(ticket.dateClosed).toISOString()
+                          : formatDateTime(ticket.dateClosed)
+                        : "—"
+                    }
+                    mono={["resolved", "closed", "cancelled"].includes(ticket.status) && !!ticket.dateClosed}
+                  />
                   <KeyValueRow label="Source" value={ticket.source} />
                 </div>
               </div>
             </Panel>
+
+            {/* Support Time — only visible when resolved/closed */}
+            {["resolved", "closed", "cancelled"].includes(ticket.status) ? (
+              <SupportTimePanel
+                ticket={ticket}
+                canEdit={!!(canEditAny || canClose)}
+                onPatch={patch}
+              />
+            ) : null}
 
             {ticket.attachments.length > 0 ? (
               <Panel title="Attachments" hint={`${ticket.attachments.length} file(s)`}>
@@ -752,6 +773,107 @@ export default function TicketDetailPage() {
         </div>
       </div>
     </AppPage>
+  );
+}
+
+/* ─── Support Time Panel ─────────────────────────────────────────────────── */
+
+function SupportTimePanel({
+  ticket,
+  canEdit,
+  onPatch,
+}: {
+  ticket: Ticket;
+  canEdit: boolean;
+  onPatch: (payload: Record<string, unknown>) => Promise<void>;
+}) {
+  const [start, setStart] = React.useState<string | undefined>(
+    ticket.supportStartTime ?? undefined,
+  );
+  const [end, setEnd] = React.useState<string | undefined>(
+    ticket.supportEndTime ?? undefined,
+  );
+
+  // Keep local state in sync if the ticket reloads from the server.
+  React.useEffect(() => {
+    setStart(ticket.supportStartTime ?? undefined);
+    setEnd(ticket.supportEndTime ?? undefined);
+  }, [ticket.supportStartTime, ticket.supportEndTime]);
+
+  /** Duration in minutes between start and end, or null if either is missing. */
+  const durationMinutes = React.useMemo(() => {
+    if (!start || !end) return null;
+    const diff = new Date(end).getTime() - new Date(start).getTime();
+    if (diff <= 0) return null;
+    return Math.round(diff / 60000);
+  }, [start, end]);
+
+  function handleStart(iso: string | undefined) {
+    setStart(iso);
+    void onPatch({ supportStartTime: iso ?? null });
+  }
+
+  function handleEnd(iso: string | undefined) {
+    setEnd(iso);
+    void onPatch({ supportEndTime: iso ?? null });
+  }
+
+  const formatMin = (mins: number) => {
+    if (mins < 60) return `${mins} min`;
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  };
+
+  return (
+    <Panel
+      title="Support Time"
+      hint="start → end of active support"
+    >
+      <div className="space-y-3 p-4">
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <p className="mb-1 text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
+              Start of Support
+            </p>
+            <DateTimePicker
+              value={start}
+              onChange={handleStart}
+              disabled={!canEdit}
+              placeholder="Set start time"
+            />
+          </div>
+          <div>
+            <p className="mb-1 text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
+              End of Support
+            </p>
+            <DateTimePicker
+              value={end}
+              onChange={handleEnd}
+              disabled={!canEdit}
+              placeholder="Set end time"
+            />
+          </div>
+        </div>
+
+        {/* Duration badge */}
+        <div
+          className="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2"
+        >
+          <Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <span className="text-[11px] text-muted-foreground">Duration:</span>
+          {durationMinutes !== null ? (
+            <span className="font-mono text-[12px] font-bold text-foreground">
+              {formatMin(durationMinutes)}
+            </span>
+          ) : (
+            <span className="text-[11px] text-muted-foreground italic">
+              Set both times to calculate
+            </span>
+          )}
+        </div>
+      </div>
+    </Panel>
   );
 }
 

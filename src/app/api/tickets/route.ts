@@ -57,6 +57,8 @@ type CreateBody = {
   priority?: string;
   status?: string;
   scheduledDate?: string | null;
+  supportStartTime?: string | null;
+  supportEndTime?: string | null;
   remarks?: string;
   source?: "manual" | "email" | "webform";
   /** base64 payloads, uploaded to Supabase Storage before the ticket is created. */
@@ -116,6 +118,8 @@ export const POST = withApi(async (req: Request) => {
         priority: body.priority,
         status: body.status,
         scheduledDate: body.scheduledDate ? new Date(body.scheduledDate) : null,
+        supportStartTime: body.supportStartTime ? new Date(body.supportStartTime) : null,
+        supportEndTime: body.supportEndTime ? new Date(body.supportEndTime) : null,
         remarks: body.remarks,
         source: body.source ?? "manual",
         attachments: storedIds,

@@ -47,6 +47,8 @@ export type TicketDTO = {
   dateCreated: string;
   dateClosed: string | null;
   dateReopened: string | null;
+  supportStartTime: string | null;
+  supportEndTime: string | null;
 
   source: string;
   emailThreadId?: string;
@@ -202,6 +204,8 @@ export function toTicketDTO(doc: Record<string, unknown>): TicketDTO {
     dateCreated,
     dateClosed,
     dateReopened: iso(doc.dateReopened),
+    supportStartTime: iso(doc.supportStartTime),
+    supportEndTime: iso(doc.supportEndTime),
 
     source: String(doc.source ?? "manual"),
     emailThreadId: doc.emailThreadId ? String(doc.emailThreadId) : undefined,

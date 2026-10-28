@@ -107,6 +107,8 @@ export type Ticket = {
   dateCreated: string;
   dateClosed: string | null;
   dateReopened: string | null;
+  supportStartTime: string | null;
+  supportEndTime: string | null;
 
   source: string;
   emailThreadId?: string;
