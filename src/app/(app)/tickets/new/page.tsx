@@ -622,7 +622,7 @@ function RequestorPicker({
             className="rounded-md border border-dashed border-border p-3"
           >
             <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.15em] text-muted-foreground">
-              Quick add requestor
+              Quick add requestors
             </p>
             <div className="grid gap-2 sm:grid-cols-2">
               <TextInput
